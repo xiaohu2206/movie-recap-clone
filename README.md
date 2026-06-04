@@ -32,6 +32,86 @@ $env:CLONE_AI_MODEL = "gpt-4o-mini"
 
 第 6 步没有本地兜底策略；缺少 API Key、AI 调用失败或返回结构不完整时会直接报错。
 
+## 前后端开发运行
+
+后端是 Python 流水线，前端是 `frontend` 目录下的 Electron + React + Vite 桌面应用。开发时建议先准备后端虚拟环境，再启动前端桌面壳。
+
+### 1. 准备后端环境
+
+```powershell
+cd .\clone_narration_video
+.\setup_venv.ps1 -TorchWheel cu124
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+如本机 CUDA/PyTorch 版本不匹配，可把 `cu124` 换成 `cu121` 或 `cpu`。
+
+### 2. 启动前端开发桌面应用
+
+```powershell
+cd .\frontend
+npm install
+$env:ELECTRON_RUN_AS_NODE = $null
+npm run dev
+```
+
+`npm run dev` 会同时启动 Vite 前端服务和 Electron 桌面窗口。桌面窗口里点击“开始生成”时，会调用项目根目录的 `main.py`，并把日志回传到前端界面。
+
+如果只想在浏览器里预览页面：
+
+```powershell
+cd .\frontend
+npm run build
+npm run preview -- --host 127.0.0.1 --port 4173
+```
+
+浏览器预览模式不会真正调用后端，只用于检查界面。
+
+### 3. 单独运行后端完整流水线
+
+```powershell
+cd .\clone_narration_video
+.\.venv\Scripts\Activate.ps1
+
+python .\main.py `
+  --ref-video-path .\data\ref.mp4 `
+  --movie-path .\data\movie.mp4 `
+  --subtitle-srt .\data\ref.srt `
+  --ai-provider custom_openai `
+  --render-mode both
+```
+
+### 4. 打包 Windows exe
+
+```powershell
+cd .\frontend
+$env:ELECTRON_RUN_AS_NODE = $null
+npm run dist
+```
+
+生成安装包：
+
+```text
+frontend\release\Clone Narration Studio-Setup-1.0.0.exe
+```
+
+生成免安装目录版：
+
+```powershell
+cd .\frontend
+$env:ELECTRON_RUN_AS_NODE = $null
+npm run pack:dir
+```
+
+输出位置：
+
+```text
+frontend\release\win-unpacked\Clone Narration Studio.exe
+```
+
+注意：当前打包会把后端脚本资源放入安装包，但目标机器仍需要可用的 Python 环境和依赖。若要做完整离线交付，需要后续把 Python runtime 或 `.venv` 一起纳入安装流程。
+
 ## 单步运行
 
 下面命令默认已经在 `clone_narration_video` 目录下，并已激活 `.venv`。

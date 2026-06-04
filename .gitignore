@@ -4,3 +4,16 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 data/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/release/
+
+# Frontend local caches and logs
+frontend/.vite/
+frontend/.asar-check/
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*

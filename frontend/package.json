@@ -1,0 +1,105 @@
+{
+  "name": "clone-narration-studio",
+  "version": "1.0.0",
+  "description": "Desktop front-end for clone_narration_video",
+  "main": "electron/main.cjs",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "electron": "electron .",
+    "dist": "npm run build && electron-builder --win nsis --x64",
+    "pack:dir": "npm run build && electron-builder --win dir --x64"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.cloneNarration.studio",
+    "productName": "Clone Narration Studio",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../main.py",
+        "to": "backend/main.py"
+      },
+      {
+        "from": "../requirements.txt",
+        "to": "backend/requirements.txt"
+      },
+      {
+        "from": "../1_reference_analyzer",
+        "to": "backend/1_reference_analyzer"
+      },
+      {
+        "from": "../2_narration_segmenter",
+        "to": "backend/2_narration_segmenter"
+      },
+      {
+        "from": "../3_movie_shot_parser",
+        "to": "backend/3_movie_shot_parser"
+      },
+      {
+        "from": "../4_visual_alignment_engine",
+        "to": "backend/4_visual_alignment_engine"
+      },
+      {
+        "from": "../5_script_visual_binder",
+        "to": "backend/5_script_visual_binder"
+      },
+      {
+        "from": "../6_rewrite_engine",
+        "to": "backend/6_rewrite_engine"
+      },
+      {
+        "from": "../7_timeline_composer",
+        "to": "backend/7_timeline_composer"
+      },
+      {
+        "from": "../8_generate_video",
+        "to": "backend/8_generate_video"
+      },
+      {
+        "from": "../utils",
+        "to": "backend/utils"
+      },
+      {
+        "from": "../model",
+        "to": "backend/model"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
