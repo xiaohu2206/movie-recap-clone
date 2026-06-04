@@ -50,7 +50,7 @@ type PipelineConfig = {
   videoEncoder: VideoEncoder;
 };
 
-type StageState = "waiting" | "running" | "done" | "failed";
+type StageState = "waiting" | "running" | "done" | "failed" | "skipped";
 
 type Stage = {
   id: string;
@@ -208,6 +208,16 @@ function outputPath(root: string, relative: string) {
   return `${root.replace(/[\\/]$/, "")}\\${relative.replace("outputs/", "").replace(/\//g, "\\")}`;
 }
 
+function isStageEnabled(stage: Stage, renderMode: RenderMode) {
+  return renderMode !== "none" || stage.id !== "render";
+}
+
+function createStageStates(renderMode: RenderMode) {
+  return Object.fromEntries(
+    stages.map((stage) => [stage.id, isStageEnabled(stage, renderMode) ? "waiting" : "skipped"]),
+  ) as Record<string, StageState>;
+}
+
 function App() {
   const [config, setConfig] = useState<PipelineConfig>(defaultConfig);
   const [backendInfo, setBackendInfo] = useState<BackendInfo | null>(null);
@@ -218,9 +228,7 @@ function App() {
   const [logLines, setLogLines] = useState<LogLine[]>([
     { id: 1, level: "system", text: "工作台已就绪。请选择参考视频和原片后启动流水线。" },
   ]);
-  const [stageStates, setStageStates] = useState<Record<string, StageState>>(() =>
-    Object.fromEntries(stages.map((stage) => [stage.id, "waiting" as StageState])),
-  );
+  const [stageStates, setStageStates] = useState<Record<string, StageState>>(() => createStageStates(defaultConfig.renderMode));
   const nextLogId = useRef(2);
   const logRef = useRef<HTMLDivElement>(null);
 
@@ -238,10 +246,9 @@ function App() {
         setIsRunning(true);
         setStartedAt(new Date());
         setFinishedCode(null);
-        setStageStates(Object.fromEntries(stages.map((stage) => [stage.id, "waiting" as StageState])));
+        setStageStates(createStageStates(config.renderMode));
         pushLog("system", `启动命令: ${event.command}`);
         pushLog("system", `输出目录: ${event.outputRoot}`);
-        markStageFromText(event.command);
       }
 
       if (event.type === "stdout") {
@@ -269,17 +276,15 @@ function App() {
         setIsRunning(false);
         setFinishedCode(event.code ?? null);
         setStageStates((previous) => {
-          const next = { ...previous };
           const hasFailure = event.code !== 0;
-          for (const stage of stages) {
-            if (next[stage.id] === "running") {
-              next[stage.id] = hasFailure ? "failed" : "done";
-            }
-            if (!hasFailure && next[stage.id] === "waiting") {
-              next[stage.id] = config.renderMode === "none" && stage.id === "render" ? "waiting" : "done";
-            }
+          if (hasFailure) {
+            return Object.fromEntries(
+              stages.map((stage) => [stage.id, previous[stage.id] === "running" ? "failed" : previous[stage.id]]),
+            ) as Record<string, StageState>;
           }
-          return next;
+          return Object.fromEntries(
+            stages.map((stage) => [stage.id, isStageEnabled(stage, config.renderMode) ? "done" : "skipped"]),
+          ) as Record<string, StageState>;
         });
         pushLog(event.code === 0 ? "system" : "error", event.code === 0 ? "流水线完成。" : `流水线退出，代码 ${event.code}`);
       }
@@ -311,21 +316,29 @@ function App() {
   }
 
   function markStageFromText(text: string) {
-    const nextIndex = stages.findIndex((stage) => stage.patterns.some((pattern) => text.includes(pattern)));
+    const marker = text.match(/\[pipeline\]\s+([1-8])_/);
+    const nextIndex = marker ? Number(marker[1]) - 1 : -1;
     if (nextIndex < 0) {
       return;
     }
     setStageStates((previous) => {
-      const next = { ...previous };
-      stages.forEach((stage, index) => {
-        if (index < nextIndex && next[stage.id] !== "failed") {
-          next[stage.id] = "done";
-        }
-        if (index === nextIndex && next[stage.id] !== "done" && next[stage.id] !== "failed") {
-          next[stage.id] = "running";
-        }
-      });
-      return next;
+      return Object.fromEntries(
+        stages.map((stage, index) => {
+          if (!isStageEnabled(stage, config.renderMode)) {
+            return [stage.id, "skipped"];
+          }
+          if (previous[stage.id] === "failed") {
+            return [stage.id, "failed"];
+          }
+          if (index < nextIndex) {
+            return [stage.id, "done"];
+          }
+          if (index === nextIndex) {
+            return [stage.id, "running"];
+          }
+          return [stage.id, "waiting"];
+        }),
+      ) as Record<string, StageState>;
     });
   }
 
@@ -383,11 +396,12 @@ function App() {
     await cloneBridge.stopPipeline();
   }
 
+  const activeStageCount = useMemo(() => stages.filter((stage) => isStageEnabled(stage, config.renderMode)).length, [config.renderMode]);
   const completedCount = useMemo(
-    () => Object.values(stageStates).filter((state) => state === "done").length,
-    [stageStates],
+    () => stages.filter((stage) => isStageEnabled(stage, config.renderMode) && stageStates[stage.id] === "done").length,
+    [config.renderMode, stageStates],
   );
-  const progress = Math.round((completedCount / stages.length) * 100);
+  const progress = Math.round((completedCount / activeStageCount) * 100);
   const canStart = config.refVideoPath && config.moviePath && !isRunning;
 
   return (
@@ -421,7 +435,7 @@ function App() {
           </div>
           <div>
             <strong>{isRunning ? "正在生成" : finishedCode === 0 ? "已完成" : "待启动"}</strong>
-            <span>{completedCount} / {stages.length} 阶段完成</span>
+            <span>{completedCount} / {activeStageCount} 阶段完成</span>
           </div>
         </div>
 
@@ -746,6 +760,7 @@ function StageRow({ stage, state, targetPath }: { stage: Stage; state: StageStat
     running: <CircleNotch className="spin" />,
     done: <CheckCircle weight="fill" />,
     failed: <WarningCircle weight="fill" />,
+    skipped: <Prohibit />,
   }[state];
 
   return (
@@ -769,6 +784,9 @@ function StageRow({ stage, state, targetPath }: { stage: Stage; state: StageStat
 }
 
 function stateText(state: StageState) {
+  if (state === "skipped") {
+    return "已跳过";
+  }
   if (state === "running") {
     return "运行中";
   }

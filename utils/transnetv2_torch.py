@@ -358,6 +358,17 @@ class _ColorHistograms(nn.Module):
 import random
 
 
+def _cuda_usable() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        torch.zeros(1, device="cuda")
+        return True
+    except Exception:
+        logger.warning("[TransNetV2] CUDA 不可用或与当前 PyTorch 不兼容，回退 CPU")
+        return False
+
+
 class TransNetV2Torch:
     def __init__(self, model_dir: str, device: Optional[str] = None):
         self._device = self._resolve_device(device)
@@ -382,13 +393,13 @@ class TransNetV2Torch:
     def _resolve_device(self, device: Optional[str]) -> torch.device:
         raw = str(device or os.environ.get("TRANSNETV2_DEVICE") or "auto").strip().lower()
         if raw in {"auto", ""}:
-            return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        if raw.startswith("cuda") and not torch.cuda.is_available():
+            return torch.device("cuda") if _cuda_usable() else torch.device("cpu")
+        if raw.startswith("cuda") and not _cuda_usable():
             return torch.device("cpu")
         try:
             return torch.device(raw)
         except Exception:
-            return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            return torch.device("cuda") if _cuda_usable() else torch.device("cpu")
 
     def get_backend_info(self) -> dict:
         return {"backend": "torch", "device": str(self._device)}

@@ -553,6 +553,11 @@ input[type="range"] {
   background: #fff6f3;
 }
 
+.stage-row.skipped {
+  opacity: 0.72;
+  background: #f3f2ed;
+}
+
 .stage-index {
   display: grid;
   place-items: center;
@@ -599,6 +604,10 @@ input[type="range"] {
 
 .stage-row.failed .stage-state {
   color: var(--danger);
+}
+
+.stage-row.skipped .stage-state {
+  color: var(--muted);
 }
 
 .log-panel {

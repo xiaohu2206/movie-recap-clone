@@ -6,7 +6,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.cli_bootstrap import add_project_to_syspath
+
+add_project_to_syspath()
 
 from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.project_paths import default_output_dir

@@ -1,7 +1,7 @@
 param(
   [string]$Python = "python",
   [string]$VenvPath = ".\.venv",
-  [ValidateSet("default", "cpu", "cu121", "cu124")]
+  [ValidateSet("default", "cpu", "cu121", "cu124", "cu128")]
   [string]$TorchWheel = "default"
 )
 
@@ -22,6 +22,8 @@ if ($TorchWheel -eq "cpu") {
   & $Pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu121
 } elseif ($TorchWheel -eq "cu124") {
   & $Pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu124
+} elseif ($TorchWheel -eq "cu128") {
+  & $Pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu128
 }
 
 Write-Host "虚拟环境已准备好: $Venv"

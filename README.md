@@ -14,13 +14,14 @@
 ## 环境
 
 ```powershell
-cd .\clone_narration_video
-.\setup_venv.ps1 -TorchWheel cu124
+cd .\movie-recap-clone
+.\setup_venv.ps1 -TorchWheel cu128
 .\.venv\Scripts\Activate.ps1
 ```
 
-如本机 CUDA/PyTorch 版本不匹配，可改用 `-TorchWheel cu121` 或 `-TorchWheel cpu`。
-镜头分割会优先使用 `model\transnetv2-weights\transnetv2-pytorch-weights.pth`，`torch.cuda.is_available()` 为 true 时自动走 GPU；ffmpeg 解码会在检测到 CUDA hwaccel 时优先尝试 GPU。
+如本机 CUDA/PyTorch 版本不匹配，可改用 `-TorchWheel cu124`、`-TorchWheel cu121` 或 `-TorchWheel cpu`。
+**RTX 50 系列（Blackwell，sm_120）必须使用 `cu128`**，否则 PyTorch 会报 GPU 不兼容警告且无法使用 CUDA。
+镜头分割会优先使用 `model\transnetv2-weights\transnetv2-pytorch-weights.pth`，GPU 可用时自动走 GPU；ffmpeg 解码会在检测到 CUDA hwaccel 时优先尝试 GPU。
 
 第 6 步默认使用 OpenAI 兼容接口。可通过环境变量配置：
 
@@ -39,13 +40,13 @@ $env:CLONE_AI_MODEL = "gpt-4o-mini"
 ### 1. 准备后端环境
 
 ```powershell
-cd .\clone_narration_video
-.\setup_venv.ps1 -TorchWheel cu124
+cd .\movie-recap-clone
+.\setup_venv.ps1 -TorchWheel cu128
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-如本机 CUDA/PyTorch 版本不匹配，可把 `cu124` 换成 `cu121` 或 `cpu`。
+如本机 CUDA/PyTorch 版本不匹配，可把 `cu128` 换成 `cu124`、`cu121` 或 `cpu`。RTX 50 系列请使用 `cu128`。
 
 ### 2. 启动前端开发桌面应用
 

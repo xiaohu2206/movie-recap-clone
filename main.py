@@ -15,6 +15,10 @@ def _run(args: list[str]) -> None:
         raise SystemExit(proc.returncode)
 
 
+def _stage(step: int, name: str, output_path: Path) -> None:
+    print(f"[pipeline] {step}_{name} -> {output_path}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="clone_narration_video pipeline")
     parser.add_argument("--ref-video-path", required=True)
@@ -63,8 +67,10 @@ def main() -> None:
     ]
     if args.subtitle_srt:
         ref_cmd += ["--subtitle-srt", args.subtitle_srt]
+    _stage(1, "reference_analyzer", ref_dir / "ref_analysis.json")
     _run(ref_cmd)
 
+    _stage(2, "narration_segmenter", seg_dir / "narration_segments.json")
     _run(
         [
             str(ROOT / "2_narration_segmenter" / "run.py"),
@@ -74,6 +80,7 @@ def main() -> None:
             str(seg_dir),
         ]
     )
+    _stage(3, "movie_shot_parser", movie_dir / "movie_shots.json")
     _run(
         [
             str(ROOT / "3_movie_shot_parser" / "run.py"),
@@ -87,6 +94,7 @@ def main() -> None:
             args.backend,
         ]
     )
+    _stage(4, "visual_alignment_engine", align_dir / "ref_to_movie_timeline.json")
     _run(
         [
             str(ROOT / "4_visual_alignment_engine" / "run.py"),
@@ -98,6 +106,7 @@ def main() -> None:
             str(align_dir),
         ]
     )
+    _stage(5, "script_visual_binder", bind_dir / "script_mapping.json")
     _run(
         [
             str(ROOT / "5_script_visual_binder" / "run.py"),
@@ -127,8 +136,10 @@ def main() -> None:
         rewrite_cmd += ["--base-url", args.ai_base_url]
     if args.ai_model:
         rewrite_cmd += ["--model", args.ai_model]
+    _stage(6, "rewrite_engine", rewrite_dir / "rewritten_script.json")
     _run(rewrite_cmd)
 
+    _stage(7, "timeline_composer", final_dir / "final_timeline.json")
     _run(
         [
             str(ROOT / "7_timeline_composer" / "run.py"),
@@ -148,6 +159,7 @@ def main() -> None:
     )
 
     if args.render_mode != "none":
+        _stage(8, "generate_video", generate_dir / "generate_video_result.json")
         generate_cmd = [
             str(ROOT / "8_generate_video" / "run.py"),
             "--timeline",
