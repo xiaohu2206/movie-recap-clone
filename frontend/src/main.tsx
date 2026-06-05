@@ -167,7 +167,7 @@ const defaultConfig: PipelineConfig = {
   aiModel: "gpt-4o-mini",
   aiTemperature: 0.7,
   charsPerSecond: 4.2,
-  renderMode: "both",
+  renderMode: "draft",
   edgeVoiceId: "zh-CN-XiaoxiaoNeural",
   edgeTtsSpeed: 1,
   jianyingDraftDir: "",
@@ -240,6 +240,26 @@ function createStageStates(renderMode: RenderMode) {
   return Object.fromEntries(
     stages.map((stage) => [stage.id, isStageEnabled(stage, renderMode) ? "waiting" : "skipped"]),
   ) as Record<string, StageState>;
+}
+
+function renderModeFromTargets(outputDraft: boolean, outputVideo: boolean): RenderMode {
+  if (outputDraft && outputVideo) {
+    return "both";
+  }
+  if (outputDraft) {
+    return "draft";
+  }
+  if (outputVideo) {
+    return "video";
+  }
+  return "none";
+}
+
+function renderTargetsFromMode(renderMode: RenderMode) {
+  return {
+    outputDraft: renderMode === "draft" || renderMode === "both",
+    outputVideo: renderMode === "video" || renderMode === "both",
+  };
 }
 
 function App() {
@@ -466,6 +486,20 @@ function App() {
     setConfig((previous) => ({ ...previous, [key]: value }));
   }
 
+  function updateRenderTarget(target: "draft" | "video", checked: boolean) {
+    setConfig((previous) => {
+      const targets = renderTargetsFromMode(previous.renderMode);
+      const nextTargets = {
+        ...targets,
+        [target === "draft" ? "outputDraft" : "outputVideo"]: checked,
+      };
+      return {
+        ...previous,
+        renderMode: renderModeFromTargets(nextTargets.outputDraft, nextTargets.outputVideo),
+      };
+    });
+  }
+
   async function chooseVideo(key: "refVideoPath" | "moviePath", title: string) {
     const selected = await cloneBridge.selectFile({ title, filters: videoFilters });
     if (selected) {
@@ -562,6 +596,7 @@ function App() {
     }
   }
 
+  const renderTargets = renderTargetsFromMode(config.renderMode);
   const activeStageCount = useMemo(() => stages.filter((stage) => isStageEnabled(stage, config.renderMode)).length, [config.renderMode]);
   const completedCount = useMemo(
     () => stages.filter((stage) => isStageEnabled(stage, config.renderMode) && stageStates[stage.id] === "done").length,
@@ -729,16 +764,30 @@ function App() {
                   <h2>输出目标</h2>
                 </div>
               </div>
-              <SegmentedControl
-                value={config.renderMode}
-                options={[
-                  ["none", "时间线"],
-                  ["draft", "剪映草稿"],
-                  ["video", "MP4"],
-                  ["both", "全部"],
-                ]}
-                onChange={(value) => updateConfig("renderMode", value as RenderMode)}
-              />
+              <div className="render-options">
+                <label className={cx("check-option", renderTargets.outputVideo && "active")}>
+                  <input
+                    type="checkbox"
+                    checked={renderTargets.outputVideo}
+                    onChange={(event) => updateRenderTarget("video", event.target.checked)}
+                  />
+                  <span>
+                    <strong>直接输出视频</strong>
+                    <small>生成最终 MP4 成片</small>
+                  </span>
+                </label>
+                <label className={cx("check-option", renderTargets.outputDraft && "active")}>
+                  <input
+                    type="checkbox"
+                    checked={renderTargets.outputDraft}
+                    onChange={(event) => updateRenderTarget("draft", event.target.checked)}
+                  />
+                  <span>
+                    <strong>输出剪映草稿</strong>
+                    <small>需确保剪映草稿路径正确</small>
+                  </span>
+                </label>
+              </div>
               <div className="form-stack">
                 <label>
                   输出目录
@@ -979,22 +1028,6 @@ function AssetPicker(props: {
           </button>
         )}
       </div>
-    </div>
-  );
-}
-
-function SegmentedControl(props: {
-  value: string;
-  options: Array<[string, string]>;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <div className="segmented-control">
-      {props.options.map(([value, label]) => (
-        <button key={value} className={props.value === value ? "active" : ""} onClick={() => props.onChange(value)}>
-          {label}
-        </button>
-      ))}
     </div>
   );
 }

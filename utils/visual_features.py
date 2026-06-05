@@ -85,8 +85,168 @@ def compare_features(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float]:
     }
 
 
-def first_keyframe(item: dict[str, Any]) -> str | None:
+def compare_features_lightweight(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float]:
+    if not a.get("ok") or not b.get("ok"):
+        return {"score": 0.0, "hash": 0.0, "hist": 0.0, "orb": 0.0}
+
+    hash_score = _hash_similarity(int(a["dhash"]), int(b["dhash"]))
+    hist_score = float(cv2.compareHist(a["hist"].astype("float32"), b["hist"].astype("float32"), cv2.HISTCMP_CORREL))
+    hist_score = max(0.0, min(1.0, (hist_score + 1.0) / 2.0))
+    score = hash_score * 0.55 + hist_score * 0.45
+    return {
+        "score": round(float(score), 4),
+        "hash": round(float(hash_score), 4),
+        "hist": round(float(hist_score), 4),
+        "orb": 0.0,
+    }
+
+
+def _unique_keep_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def select_keyframes(item: dict[str, Any], max_frames: int = 3) -> list[str]:
     frames = item.get("keyframes")
-    if isinstance(frames, list) and frames:
-        return str(frames[0])
-    return None
+    if not isinstance(frames, list) or not frames:
+        return []
+
+    cleaned = [str(frame) for frame in frames if frame]
+    if not cleaned:
+        return []
+
+    max_frames = max(1, int(max_frames))
+    if len(cleaned) <= max_frames:
+        return _unique_keep_order(cleaned)
+
+    if max_frames == 1:
+        mid = len(cleaned) // 2
+        return [cleaned[mid]]
+
+    picks = [0, len(cleaned) // 2, len(cleaned) - 1]
+    if max_frames > 3:
+        step = (len(cleaned) - 1) / float(max_frames - 1)
+        picks = [round(i * step) for i in range(max_frames)]
+    return _unique_keep_order([cleaned[int(i)] for i in picks])
+
+
+def _frame_role(index: int, total: int) -> str:
+    if total <= 1:
+        return "middle"
+    if index == 0:
+        return "start"
+    if index == total - 1:
+        return "end"
+    return "middle"
+
+
+def build_shot_feature(
+    item: dict[str, Any],
+    *,
+    max_frames: int = 3,
+    feature_mode: str = "classic",
+) -> dict[str, Any]:
+    frames = select_keyframes(item, max_frames=max_frames)
+    features = []
+    for index, path in enumerate(frames):
+        features.append(
+            {
+                "frame_role": _frame_role(index, len(frames)),
+                "feature": build_frame_feature(path),
+            }
+        )
+
+    return {
+        "shot_id": str(item.get("movie_shot_id") or item.get("ref_shot_id") or item.get("shot_id") or ""),
+        "start": float(item.get("start") or 0.0),
+        "end": float(item.get("end") or 0.0),
+        "keyframes": frames,
+        "features": features,
+        "feature_mode": feature_mode,
+        "ok": any(row["feature"].get("ok") for row in features),
+    }
+
+
+def _lightweight_from_detail(detail: dict[str, float]) -> float:
+    return detail["hash"] * 0.55 + detail["hist"] * 0.45
+
+
+def _aggregate_pair_scores(rows: list[dict[str, Any]], score_key: str) -> float:
+    if not rows:
+        return 0.0
+    ordered = sorted((float(row[score_key]) for row in rows), reverse=True)
+    top_score = ordered[0]
+    top3_avg = sum(ordered[:3]) / min(3, len(ordered))
+    return top_score * 0.6 + top3_avg * 0.4
+
+
+def compare_shot_features(a: dict[str, Any], b: dict[str, Any], *, include_orb: bool = True) -> dict[str, Any]:
+    pair_rows: list[dict[str, Any]] = []
+    for ref_frame in a.get("features") or []:
+        for movie_frame in b.get("features") or []:
+            detail = (
+                compare_features(ref_frame.get("feature") or {}, movie_frame.get("feature") or {})
+                if include_orb
+                else compare_features_lightweight(ref_frame.get("feature") or {}, movie_frame.get("feature") or {})
+            )
+            pair_rows.append(
+                {
+                    "ref_frame_role": ref_frame.get("frame_role") or "",
+                    "ref_frame_path": (ref_frame.get("feature") or {}).get("path"),
+                    "movie_frame_role": movie_frame.get("frame_role") or "",
+                    "movie_frame_path": (movie_frame.get("feature") or {}).get("path"),
+                    "score": detail["score"],
+                    "lightweight_score": round(float(detail["score"] if not include_orb else _lightweight_from_detail(detail)), 4),
+                    "detail": detail,
+                }
+            )
+
+    if not pair_rows:
+        return {
+            "score": 0.0,
+            "lightweight_score": 0.0,
+            "hash": 0.0,
+            "hist": 0.0,
+            "orb": 0.0,
+            "best_pair": None,
+            "top_pairs": [],
+        }
+
+    score = _aggregate_pair_scores(pair_rows, "score")
+    lightweight_score = _aggregate_pair_scores(pair_rows, "lightweight_score")
+    top_pairs = sorted(pair_rows, key=lambda row: row["score"], reverse=True)[:3]
+    best_detail = top_pairs[0]["detail"]
+    return {
+        "score": round(float(score), 4),
+        "lightweight_score": round(float(lightweight_score), 4),
+        "hash": best_detail["hash"],
+        "hist": best_detail["hist"],
+        "orb": best_detail["orb"],
+        "best_pair": {
+            "ref_frame_role": top_pairs[0]["ref_frame_role"],
+            "movie_frame_role": top_pairs[0]["movie_frame_role"],
+            "ref_frame_path": top_pairs[0]["ref_frame_path"],
+            "movie_frame_path": top_pairs[0]["movie_frame_path"],
+            "score": top_pairs[0]["score"],
+        },
+        "top_pairs": [
+            {
+                "ref_frame_role": row["ref_frame_role"],
+                "movie_frame_role": row["movie_frame_role"],
+                "score": row["score"],
+                "detail": row["detail"],
+            }
+            for row in top_pairs
+        ],
+    }
+
+
+def first_keyframe(item: dict[str, Any]) -> str | None:
+    frames = select_keyframes(item, max_frames=1)
+    return frames[0] if frames else None

@@ -14,6 +14,8 @@ from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 
+ACCEPTED_VISUAL_STATUSES = {"matched", "matched_low_confidence", "inferred_by_neighbors"}
+
 
 def _role(index: int, total: int) -> str:
     if index == 0:
@@ -36,7 +38,7 @@ def bind_script_visual(
         ranges = []
         for ref_id in seg.get("ref_shot_ids") or []:
             match = by_ref.get(str(ref_id))
-            if not match or match.get("status") != "matched":
+            if not match or match.get("status") not in ACCEPTED_VISUAL_STATUSES:
                 continue
             ranges.append(
                 {

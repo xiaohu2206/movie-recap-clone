@@ -453,6 +453,10 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
 
   const outputRoot = config.outputRoot || path.join(root, "outputs");
   const logPath = pipelineLogPath(outputRoot);
+  const renderMode = config.renderMode || "draft";
+  if ((renderMode === "draft" || renderMode === "both") && config.jianyingDraftDir && !fs.existsSync(config.jianyingDraftDir)) {
+    return { ok: false, error: `剪映草稿路径不存在: ${config.jianyingDraftDir}` };
+  }
   const aiApiKey = String(config.aiApiKey || process.env.CLONE_AI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
   const aiBaseUrl = String(config.aiBaseUrl || process.env.CLONE_AI_BASE_URL || process.env.OPENAI_BASE_URL || "").trim();
   const aiModel = String(config.aiModel || process.env.CLONE_AI_MODEL || process.env.OPENAI_MODEL || "").trim();
@@ -479,7 +483,7 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
     "--chars-per-second",
     String(config.charsPerSecond),
     "--render-mode",
-    config.renderMode,
+    renderMode,
     "--edge-voice-id",
     config.edgeVoiceId,
     "--edge-tts-speed",
@@ -515,7 +519,7 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   writePipelineMemory(outputRoot, {
     status: "running",
     runMode: config.runMode || "normal",
-    configSignature: configSignature({ ...config, outputRoot }),
+    configSignature: configSignature({ ...config, outputRoot, renderMode }),
     completedStages: [],
     exitCode: null,
     error: "",

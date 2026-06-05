@@ -839,7 +839,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="第 8 步：生成剪映草稿或直接合成视频")
     parser.add_argument("--timeline", default=r".\outputs\7_timeline_composer\final_timeline.json")
     parser.add_argument("--output-dir", default=str(default_output_dir("8_generate_video")))
-    parser.add_argument("--mode", choices=["draft", "video", "both"], default="both")
+    parser.add_argument("--mode", choices=["draft", "video", "both"], default="draft")
     parser.add_argument("--voice-id", default=os.getenv("CLONE_EDGE_VOICE") or "zh-CN-XiaoxiaoNeural")
     parser.add_argument("--tts-speed", type=float, default=1.0)
     parser.add_argument("--edge-proxy", default=os.getenv("EDGE_TTS_PROXY") or None)

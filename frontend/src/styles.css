@@ -548,6 +548,55 @@ button svg,
   background: var(--accent);
 }
 
+.render-options {
+  display: grid;
+  gap: 10px;
+}
+
+.check-option {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: center;
+  min-height: 62px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: #50514c;
+  background: #fffefa;
+  cursor: pointer;
+}
+
+.check-option.active {
+  border-color: #79a989;
+  background: #f3faf4;
+}
+
+.check-option input {
+  width: 18px;
+  min-height: 18px;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.check-option span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.check-option strong {
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.25;
+}
+
+.check-option small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .form-stack,
 .settings-grid {
   display: grid;
