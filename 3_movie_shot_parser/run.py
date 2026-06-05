@@ -15,6 +15,12 @@ from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 from clone_narration_video.utils.shot_detection import detect_shots
+from clone_narration_video.utils.video_tools import export_shot_clips
+
+# 大写配置-输出分割后的镜头
+EXPORT_SHOT_CLIPS = True          # 默认不开启；开启后输出分割后的镜头视频片段
+SHOT_CLIPS_DIRNAME = "shot_clips"  # 独立文件夹，用于放置分割后的镜头
+SHOT_CLIPS_RATIO = 0.2             # 默认只输出前 20% 的镜头
 
 
 def parse_movie_shots(
@@ -41,6 +47,18 @@ def parse_movie_shots(
         progress_callback=lambda percent, message: emit_progress("shots", percent, message),
     )
     emit_progress("shots", 100, "Movie shot detection complete")
+    if EXPORT_SHOT_CLIPS:
+        clip_paths = export_shot_clips(
+            video,
+            shot_result["shots"],
+            out_dir / SHOT_CLIPS_DIRNAME,
+            id_key="movie_shot_id",
+            ratio=SHOT_CLIPS_RATIO,
+            progress_callback=lambda i, total, path: emit_progress(
+                "shots", 100, f"Exported shot clip {i}/{total}"
+            ),
+        )
+        emit_progress("shots", 100, f"Exported {len(clip_paths)} shot clips")
     result = {
         "movie_id": movie_id or f"movie_{uuid.uuid4().hex[:8]}",
         "movie_path": str(video),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -13,6 +14,7 @@ add_project_to_syspath()
 from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
+from clone_narration_video.utils.video_tools import cut_clip
 from clone_narration_video.utils.visual_features import build_shot_feature, compare_shot_features
 
 from candidate_recall import build_candidates
@@ -20,7 +22,10 @@ from diagnostics import build_timeline_item, write_low_confidence_report
 from path_solver import solve_global_path, solve_greedy_path
 
 ALGORITHM_VERSION = "visual_alignment_v2"
-
+# 大写配置-输出分割后的镜头
+EXPORT_MATCHED_SHOT_CLIPS = True              # 默认不开启；开启后按 ref 镜头建子文件夹输出配对片段
+MATCHED_SHOT_CLIPS_DIRNAME = "matched_shot_clips"  # 独立文件夹；每个 ref 镜头一个子文件夹
+MATCHED_SHOT_CLIPS_RATIO = 0.2                 # 默认只输出前 20% 的镜头
 
 def _id(item: dict[str, Any], key: str) -> str:
     return str(item.get(key) or item.get("shot_id") or "")
@@ -127,6 +132,50 @@ def _summary(timeline: list[dict[str, Any]]) -> dict[str, Any]:
         "timeline_backward_count": backward_count,
         "duplicate_movie_shot_count": duplicate_count,
     }
+
+
+def export_matched_shot_clips(
+    timeline: list[dict[str, Any]],
+    ref_video_path: str | Path | None,
+    movie_video_path: str | Path | None,
+    out_dir: str | Path,
+    *,
+    ratio: float = 1.0,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> int:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    ratio = min(1.0, max(0.0, float(ratio)))
+    if not timeline:
+        return 0
+    count = len(timeline) if ratio >= 1.0 else max(1, math.ceil(len(timeline) * ratio))
+    selected = timeline[:count]
+    exported = 0
+    for idx, item in enumerate(selected, start=1):
+        ref_id = str(item.get("ref_shot_id") or f"ref_{idx:03d}")
+        sub_dir = out / ref_id
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        if ref_video_path:
+            cut_clip(
+                ref_video_path,
+                float(item.get("ref_start") or 0.0),
+                float(item.get("ref_end") or 0.0),
+                sub_dir / f"{ref_id}_ref.mp4",
+            )
+        movie_start = item.get("movie_start")
+        movie_end = item.get("movie_end")
+        if movie_video_path and movie_start is not None and movie_end is not None:
+            movie_id = (item.get("movie_shot_ids") or ["movie"])[0]
+            cut_clip(
+                movie_video_path,
+                float(movie_start),
+                float(movie_end),
+                sub_dir / f"{movie_id}_movie.mp4",
+            )
+        exported += 1
+        if progress_callback:
+            progress_callback(100, f"Exported matched shot clips {idx}/{len(selected)} ({ref_id})")
+    return exported
 
 
 def align_visual_timeline(
@@ -286,6 +335,16 @@ def main() -> None:
         progress_callback=lambda percent, message: emit_progress("alignment", percent, message),
     )
     out = write_json(output_dir / "ref_to_movie_timeline.json", result)
+    if EXPORT_MATCHED_SHOT_CLIPS:
+        exported = export_matched_shot_clips(
+            result["ref_to_movie_timeline"],
+            ref_data.get("ref_video_path"),
+            movie_data.get("movie_path"),
+            output_dir / MATCHED_SHOT_CLIPS_DIRNAME,
+            ratio=MATCHED_SHOT_CLIPS_RATIO,
+            progress_callback=lambda percent, message: emit_progress("alignment", percent, message),
+        )
+        emit_progress("alignment", 100, f"Exported {exported} matched shot clip folders")
     emit_progress("alignment", 100, "Visual alignment complete")
     print(out)
 

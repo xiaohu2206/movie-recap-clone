@@ -16,6 +16,12 @@ from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 from clone_narration_video.utils.shot_detection import detect_shots
 from clone_narration_video.utils.subtitle_tools import copy_or_create_srt, extract_srt_with_bcut
+from clone_narration_video.utils.video_tools import export_shot_clips
+
+# 大写配置-输出分割后的镜头
+EXPORT_SHOT_CLIPS = True          # 默认不开启；开启后输出分割后的镜头视频片段
+SHOT_CLIPS_DIRNAME = "shot_clips"  # 独立文件夹，用于放置分割后的镜头
+SHOT_CLIPS_RATIO = 0.2             # 默认只输出前 20% 的镜头
 
 
 def analyze_reference_video(
@@ -55,6 +61,18 @@ def analyze_reference_video(
         progress_callback=lambda percent, message: emit_progress("reference", 10.0 + percent * 0.9, message),
     )
     emit_progress("reference", 100, "Reference analysis complete")
+    if EXPORT_SHOT_CLIPS:
+        clip_paths = export_shot_clips(
+            video,
+            shot_result["shots"],
+            out_dir / SHOT_CLIPS_DIRNAME,
+            id_key="ref_shot_id",
+            ratio=SHOT_CLIPS_RATIO,
+            progress_callback=lambda i, total, path: emit_progress(
+                "reference", 100, f"Exported shot clip {i}/{total}"
+            ),
+        )
+        emit_progress("reference", 100, f"Exported {len(clip_paths)} shot clips")
     result = {
         "ref_video_id": ref_id,
         "ref_video_path": str(video),

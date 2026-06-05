@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 
-from .ffmpeg_utils import probe_duration, probe_fps
+from .ffmpeg_utils import (
+    get_ffmpeg_cuda_prefix,
+    probe_duration,
+    probe_fps,
+    resolve_ffmpeg_bin,
+    run_ffmpeg,
+)
 
 
 def video_info(path: str | Path) -> dict[str, Any]:
@@ -32,4 +39,59 @@ def extract_frame(video_path: str | Path, time_sec: float, out_path: str | Path)
     finally:
         cap.release()
     return out
+
+
+def cut_clip(video_path: str | Path, start: float, end: float, out_path: str | Path) -> Path:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    duration = max(0.04, float(end) - float(start))
+    cmd = [
+        resolve_ffmpeg_bin(),
+        "-y",
+        *get_ffmpeg_cuda_prefix(),
+        "-ss",
+        f"{max(0.0, float(start)):.3f}",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{duration:.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-c:a",
+        "aac",
+        str(out),
+    ]
+    try:
+        run_ffmpeg(cmd)
+    except RuntimeError:
+        run_ffmpeg([x for x in cmd if x not in {"-hwaccel", "cuda"}])
+    return out
+
+
+def export_shot_clips(
+    video_path: str | Path,
+    shots: list[dict[str, Any]],
+    out_dir: str | Path,
+    *,
+    id_key: str,
+    ratio: float = 1.0,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> list[str]:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    ratio = min(1.0, max(0.0, float(ratio)))
+    if not shots:
+        return []
+    count = len(shots) if ratio >= 1.0 else max(1, math.ceil(len(shots) * ratio))
+    selected = shots[:count]
+    paths: list[str] = []
+    for idx, shot in enumerate(selected, start=1):
+        sid = str(shot.get(id_key) or f"shot_{idx:03d}")
+        clip_path = cut_clip(video_path, shot["start"], shot["end"], out / f"{sid}.mp4")
+        paths.append(str(clip_path))
+        if progress_callback:
+            progress_callback(idx, len(selected), str(clip_path))
+    return paths
 
