@@ -4,7 +4,7 @@ import argparse
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.cli_bootstrap import add_project_to_syspath
@@ -12,6 +12,7 @@ from utils.cli_bootstrap import add_project_to_syspath
 add_project_to_syspath()
 
 from clone_narration_video.utils.json_io import read_json, write_json
+from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 from clone_narration_video.utils.visual_features import build_frame_feature, compare_features, first_keyframe
 
@@ -44,17 +45,22 @@ def align_visual_timeline(
     *,
     top_n: int = 8,
     min_score: float = 0.35,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     movie_features = []
-    for shot in movie_shots:
+    total_movie = len(movie_shots)
+    for idx, shot in enumerate(movie_shots, start=1):
         path = first_keyframe(shot)
         if path:
             movie_features.append((shot, build_frame_feature(path)))
+        if progress_callback and (idx == 1 or idx == total_movie or idx % 20 == 0):
+            progress_callback(5.0 + (idx / max(1, total_movie)) * 25.0, f"Indexed movie keyframes {idx}/{total_movie}")
 
     timeline: list[dict[str, Any]] = []
     prev_match: dict[str, Any] | None = None
     prev_ref_end: float | None = None
-    for ref in ref_shots:
+    total_ref = len(ref_shots)
+    for ref_index, ref in enumerate(ref_shots, start=1):
         ref_path = first_keyframe(ref)
         ref_feature = build_frame_feature(ref_path) if ref_path else {"ok": False}
         candidates = []
@@ -101,6 +107,8 @@ def align_visual_timeline(
         if status == "matched":
             prev_match = item
         prev_ref_end = float(ref.get("end") or 0.0)
+        if progress_callback and (ref_index == 1 or ref_index == total_ref or ref_index % 10 == 0):
+            progress_callback(30.0 + (ref_index / max(1, total_ref)) * 70.0, f"Aligned reference shots {ref_index}/{total_ref}")
 
     return {"ref_to_movie_timeline": timeline}
 
@@ -121,6 +129,7 @@ def main() -> None:
         movie_data.get("movie_shots") or [],
         top_n=args.top_n,
         min_score=args.min_score,
+        progress_callback=lambda percent, message: emit_progress("alignment", percent, message),
     )
     out = write_json(Path(args.output_dir) / "ref_to_movie_timeline.json", result)
     print(out)

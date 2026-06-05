@@ -12,6 +12,7 @@ from utils.cli_bootstrap import add_project_to_syspath
 add_project_to_syspath()
 
 from clone_narration_video.utils.json_io import read_json, write_json
+from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 from clone_narration_video.utils.shot_detection import detect_shots
 
@@ -30,13 +31,16 @@ def parse_movie_shots(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    emit_progress("shots", 1, "Starting movie shot detection")
     shot_result = detect_shots(
         video,
         shot_prefix="movie_shot",
         keyframe_dir=out_dir / "keyframes",
         threshold=threshold,
         backend=backend,
+        progress_callback=lambda percent, message: emit_progress("shots", percent, message),
     )
+    emit_progress("shots", 100, "Movie shot detection complete")
     result = {
         "movie_id": movie_id or f"movie_{uuid.uuid4().hex[:8]}",
         "movie_path": str(video),

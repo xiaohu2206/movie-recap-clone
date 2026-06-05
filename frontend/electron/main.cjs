@@ -5,6 +5,7 @@ const path = require("path");
 
 let mainWindow = null;
 let activeProcess = null;
+let activeOutputRoot = "";
 
 const isDev = !app.isPackaged;
 
@@ -42,6 +43,171 @@ function candidatePython(root) {
     return localPython;
   }
   return process.platform === "win32" ? "python" : "python3";
+}
+
+function jianyingDraftCandidates() {
+  const candidates = [];
+  if (process.platform === "win32") {
+    const localAppData =
+      process.env.LOCALAPPDATA ||
+      (process.env.USERPROFILE ? path.join(process.env.USERPROFILE, "AppData", "Local") : "");
+    if (localAppData) {
+      candidates.push(path.join(localAppData, "JianyingPro", "User Data", "Projects", "com.lveditor.draft"));
+      candidates.push(path.join(localAppData, "CapCut", "User Data", "Projects", "com.lveditor.draft"));
+    }
+  } else if (process.platform === "darwin") {
+    const home = process.env.HOME || app.getPath("home");
+    if (home) {
+      candidates.push(path.join(home, "Movies", "JianyingPro", "User Data", "Projects", "com.lveditor.draft"));
+      candidates.push(path.join(home, "Movies", "CapCut", "User Data", "Projects", "com.lveditor.draft"));
+    }
+  }
+  return candidates;
+}
+
+function detectJianyingDraftDir() {
+  for (const candidate of jianyingDraftCandidates()) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+        return candidate;
+      }
+    } catch {
+      // Ignore inaccessible candidates and keep probing.
+    }
+  }
+  return "";
+}
+
+const stageOutputs = [
+  ["reference", "1_reference_analyzer", "ref_analysis.json"],
+  ["segments", "2_narration_segmenter", "narration_segments.json"],
+  ["shots", "3_movie_shot_parser", "movie_shots.json"],
+  ["alignment", "4_visual_alignment_engine", "ref_to_movie_timeline.json"],
+  ["binder", "5_script_visual_binder", "script_mapping.json"],
+  ["rewrite", "6_rewrite_engine", "rewritten_script.json"],
+  ["timeline", "7_timeline_composer", "final_timeline.json"],
+  ["render", "8_generate_video", "generate_video_result.json"],
+];
+
+function hasValidJson(filePath) {
+  try {
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      return false;
+    }
+    JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pipelineStatePath(outputRoot) {
+  return path.join(outputRoot, ".pipeline_state.json");
+}
+
+function pipelineLogPath(outputRoot) {
+  return path.join(outputRoot, "logs", "pipeline.log");
+}
+
+function appendPipelineLog(logPath, level, text) {
+  if (!logPath || !text) {
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    const lines = String(text).split(/\r?\n/).filter(Boolean);
+    const stamp = new Date().toISOString();
+    const payload = lines.map((line) => `[${stamp}] [${level}] ${line}`).join("\n");
+    if (payload) {
+      fs.appendFileSync(logPath, `${payload}\n`, "utf8");
+    }
+  } catch (error) {
+    logMain(`appendPipelineLog failed: ${error.message}`);
+  }
+}
+
+function configSignature(config = {}) {
+  return JSON.stringify({
+    refVideoPath: config.refVideoPath || "",
+    moviePath: config.moviePath || "",
+    subtitlePath: config.subtitlePath || "",
+    outputRoot: config.outputRoot || "",
+    asrProvider: config.subtitlePath ? "none" : config.asrProvider,
+    threshold: config.threshold,
+    backend: config.backend,
+    aiProvider: "custom_openai",
+    aiBaseUrl: config.aiBaseUrl || "",
+    aiModel: config.aiModel || "",
+    aiTemperature: config.aiTemperature,
+    charsPerSecond: config.charsPerSecond,
+    renderMode: config.renderMode,
+    edgeVoiceId: config.edgeVoiceId,
+    edgeTtsSpeed: config.edgeTtsSpeed,
+    jianyingDraftDir: config.jianyingDraftDir || "",
+    videoOutputName: config.videoOutputName || "",
+    videoEncoder: config.videoEncoder,
+  });
+}
+
+function readPipelineMemory(outputRoot) {
+  try {
+    return JSON.parse(fs.readFileSync(pipelineStatePath(outputRoot), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writePipelineMemory(outputRoot, payload) {
+  try {
+    fs.mkdirSync(outputRoot, { recursive: true });
+    const previous = readPipelineMemory(outputRoot) || {};
+    fs.writeFileSync(
+      pipelineStatePath(outputRoot),
+      JSON.stringify({ ...previous, ...payload, updatedAt: new Date().toISOString() }, null, 2),
+      "utf8",
+    );
+  } catch (error) {
+    logMain(`writePipelineMemory failed: ${error.message}`);
+  }
+}
+
+function hasCompletedFinalOutput(outputRoot, renderMode) {
+  if (renderMode === "none") {
+    return hasValidJson(path.join(outputRoot, "7_timeline_composer", "final_timeline.json"));
+  }
+
+  const manifestPath = path.join(outputRoot, "8_generate_video", "generate_video_result.json");
+  if (!hasValidJson(manifestPath)) {
+    return false;
+  }
+
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    const mode = manifest.mode || renderMode;
+    if (mode === "video" || mode === "both") {
+      const videoPath = manifest.rendered_video?.output_video || "outputs\\8_generate_video\\clone_narration_output.mp4";
+      const absVideoPath = path.isAbsolute(videoPath)
+        ? videoPath
+        : path.join(projectRoot(), videoPath.replace(/^outputs[\\/]/, "outputs\\"));
+      if (!fs.existsSync(absVideoPath) || fs.statSync(absVideoPath).size <= 0) {
+        return false;
+      }
+    }
+    if (mode === "draft" || mode === "both") {
+      const draftDir = manifest.jianying_draft?.draft_dir;
+      const absDraftDir = draftDir
+        ? path.isAbsolute(draftDir)
+          ? draftDir
+          : path.join(projectRoot(), draftDir.replace(/^outputs[\\/]/, "outputs\\"))
+        : "";
+      if (!absDraftDir || !fs.existsSync(absDraftDir)) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function sendPipelineEvent(payload) {
@@ -110,6 +276,12 @@ ipcMain.handle("dialog:select-file", async (_event, options = {}) => {
   return result.filePaths[0];
 });
 
+ipcMain.handle("jianying:detect-draft-dir", async () => {
+  const found = detectJianyingDraftDir();
+  logMain(`detect jianying draft dir -> ${found || "(not found)"}`);
+  return found;
+});
+
 ipcMain.handle("dialog:select-directory", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: "选择目录",
@@ -122,6 +294,89 @@ ipcMain.handle("dialog:select-directory", async () => {
   return result.filePaths[0];
 });
 
+function userConfigPath() {
+  return path.join(app.getPath("userData"), "studio-config.json");
+}
+
+function normalizeChatUrl(baseUrl) {
+  let bu = String(baseUrl || "https://api.openai.com/v1").trim().replace(/`/g, "").replace(/\/+$/, "");
+  if (!bu.endsWith("/chat/completions")) {
+    bu += "/chat/completions";
+  }
+  return bu;
+}
+
+ipcMain.handle("config:load", async () => {
+  try {
+    return JSON.parse(fs.readFileSync(userConfigPath(), "utf8"));
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle("config:save", async (_event, config = {}) => {
+  try {
+    fs.writeFileSync(userConfigPath(), JSON.stringify(config, null, 2), "utf8");
+    return { ok: true };
+  } catch (error) {
+    logMain(`config:save failed: ${error.message}`);
+    return { ok: false, error: error.message };
+  }
+});
+
+ipcMain.handle("ai:test", async (_event, config = {}) => {
+  const apiKey = String(config.aiApiKey || process.env.CLONE_AI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
+  const model = String(config.aiModel || process.env.CLONE_AI_MODEL || process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
+  const url = normalizeChatUrl(config.aiBaseUrl || process.env.CLONE_AI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1");
+  if (!apiKey) {
+    return { ok: false, error: "未填写 API Key，且环境变量未提供。" };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "ping" }],
+        temperature: 0,
+        max_tokens: 1,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+    const raw = await response.text();
+    if (!response.ok) {
+      let detail = raw;
+      try {
+        const parsed = JSON.parse(raw);
+        detail = parsed.error?.message || parsed.message || raw;
+      } catch {
+        // keep raw text as detail
+      }
+      return { ok: false, error: `HTTP ${response.status}: ${String(detail).slice(0, 300)}` };
+    }
+    let resolvedModel = model;
+    try {
+      resolvedModel = JSON.parse(raw).model || model;
+    } catch {
+      // response not JSON; still treat as reachable
+    }
+    return { ok: true, model: resolvedModel };
+  } catch (error) {
+    const message = error.name === "AbortError" ? "请求超时（20 秒）。" : error.message || String(error);
+    return { ok: false, error: message };
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
 ipcMain.handle("backend:info", async () => {
   const root = projectRoot();
   return {
@@ -129,6 +384,29 @@ ipcMain.handle("backend:info", async () => {
     python: candidatePython(root),
     packaged: app.isPackaged,
     hasLocalVenv: fs.existsSync(path.join(root, ".venv", "Scripts", "python.exe")),
+  };
+});
+
+ipcMain.handle("pipeline:state", async (_event, config = {}) => {
+  const root = projectRoot();
+  const outputRoot = config.outputRoot || path.join(root, "outputs");
+  const logPath = pipelineLogPath(outputRoot);
+  const completedStages = stageOutputs
+    .filter(([, dir, file]) => hasValidJson(path.join(outputRoot, dir, file)))
+    .map(([id]) => id);
+  const finalStage = config.renderMode === "none" ? "timeline" : "render";
+  const finalOutputComplete = completedStages.includes(finalStage) && hasCompletedFinalOutput(outputRoot, config.renderMode);
+  const memory = readPipelineMemory(outputRoot);
+  const sameProject = !memory?.configSignature || memory.configSignature === configSignature({ ...config, outputRoot });
+  const completed = finalOutputComplete && (!memory || memory.status === "completed");
+
+  return {
+    ok: true,
+    outputRoot,
+    logPath,
+    completed,
+    canResume: sameProject && completedStages.length > 0 && !completed,
+    completedStages,
   };
 });
 
@@ -154,6 +432,10 @@ ipcMain.handle("pipeline:stop", async () => {
   }
   activeProcess.kill();
   activeProcess = null;
+  if (activeOutputRoot) {
+    writePipelineMemory(activeOutputRoot, { status: "stopped" });
+    activeOutputRoot = "";
+  }
   sendPipelineEvent({ type: "stopped", at: new Date().toISOString() });
   return { ok: true };
 });
@@ -170,6 +452,10 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   }
 
   const outputRoot = config.outputRoot || path.join(root, "outputs");
+  const logPath = pipelineLogPath(outputRoot);
+  const aiApiKey = String(config.aiApiKey || process.env.CLONE_AI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
+  const aiBaseUrl = String(config.aiBaseUrl || process.env.CLONE_AI_BASE_URL || process.env.OPENAI_BASE_URL || "").trim();
+  const aiModel = String(config.aiModel || process.env.CLONE_AI_MODEL || process.env.OPENAI_MODEL || "").trim();
   const args = [
     mainScript,
     "--ref-video-path",
@@ -178,6 +464,8 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
     config.moviePath,
     "--output-root",
     outputRoot,
+    "--log-file",
+    logPath,
     "--asr-provider",
     config.subtitlePath ? "none" : config.asrProvider,
     "--threshold",
@@ -205,20 +493,34 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   if (config.subtitlePath) {
     args.push("--subtitle-srt", config.subtitlePath);
   }
-  if (config.aiApiKey) {
-    args.push("--ai-api-key", config.aiApiKey);
+  if (aiBaseUrl) {
+    args.push("--ai-base-url", aiBaseUrl);
   }
-  if (config.aiBaseUrl) {
-    args.push("--ai-base-url", config.aiBaseUrl);
-  }
-  if (config.aiModel) {
-    args.push("--ai-model", config.aiModel);
+  if (aiModel) {
+    args.push("--ai-model", aiModel);
   }
   if (config.jianyingDraftDir) {
     args.push("--jianying-draft-dir", config.jianyingDraftDir);
   }
+  if (config.runMode === "resume") {
+    args.push("--resume");
+  }
+  if (config.runMode === "restart") {
+    args.push("--restart");
+  }
 
   fs.mkdirSync(outputRoot, { recursive: true });
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
+  fs.writeFileSync(logPath, `[${new Date().toISOString()}] [system] pipeline log created\n`, "utf8");
+  writePipelineMemory(outputRoot, {
+    status: "running",
+    runMode: config.runMode || "normal",
+    configSignature: configSignature({ ...config, outputRoot }),
+    completedStages: [],
+    exitCode: null,
+    error: "",
+  });
+  activeOutputRoot = outputRoot;
 
   const python = candidatePython(root);
   activeProcess = spawn(python, args, {
@@ -226,9 +528,9 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
     env: {
       ...process.env,
       PYTHONIOENCODING: "utf-8",
-      CLONE_AI_API_KEY: config.aiApiKey || process.env.CLONE_AI_API_KEY || "",
-      CLONE_AI_BASE_URL: config.aiBaseUrl || process.env.CLONE_AI_BASE_URL || "",
-      CLONE_AI_MODEL: config.aiModel || process.env.CLONE_AI_MODEL || "",
+      CLONE_AI_API_KEY: aiApiKey,
+      CLONE_AI_BASE_URL: aiBaseUrl,
+      CLONE_AI_MODEL: aiModel,
     },
     windowsHide: true,
   });
@@ -238,25 +540,43 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
     at: new Date().toISOString(),
     command: `${python} ${args.map((item) => (item.includes(" ") ? `"${item}"` : item)).join(" ")}`,
     outputRoot,
+    logPath,
   });
+  appendPipelineLog(logPath, "system", `${python} ${args.join(" ")}`);
 
   activeProcess.stdout.on("data", (chunk) => {
-    sendPipelineEvent({ type: "stdout", text: chunk.toString("utf8") });
+    const text = chunk.toString("utf8");
+    sendPipelineEvent({ type: "stdout", text });
   });
 
   activeProcess.stderr.on("data", (chunk) => {
-    sendPipelineEvent({ type: "stderr", text: chunk.toString("utf8") });
+    const text = chunk.toString("utf8");
+    sendPipelineEvent({ type: "stderr", text });
   });
 
   activeProcess.on("error", (error) => {
     activeProcess = null;
+    if (activeOutputRoot) {
+      writePipelineMemory(activeOutputRoot, { status: "error", error: error.message });
+      activeOutputRoot = "";
+    }
+    appendPipelineLog(logPath, "error", error.message);
     sendPipelineEvent({ type: "error", error: error.message, at: new Date().toISOString() });
   });
 
   activeProcess.on("close", (code) => {
     activeProcess = null;
+    writePipelineMemory(outputRoot, {
+      status: code === 0 ? "completed" : "failed",
+      exitCode: code,
+      completedStages: stageOutputs
+        .filter(([, dir, file]) => hasValidJson(path.join(outputRoot, dir, file)))
+        .map(([id]) => id),
+    });
+    activeOutputRoot = "";
+    appendPipelineLog(logPath, "system", `pipeline finished with code ${code}`);
     sendPipelineEvent({ type: "finished", code, outputRoot, at: new Date().toISOString() });
   });
 
-  return { ok: true, outputRoot };
+  return { ok: true, outputRoot, logPath };
 });

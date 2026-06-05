@@ -9,10 +9,9 @@ import shutil
 import sys
 import time
 import uuid
-import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.cli_bootstrap import add_project_to_syspath
@@ -21,6 +20,7 @@ add_project_to_syspath()
 
 from clone_narration_video.utils.ffmpeg_utils import probe_duration, ffprobe_json, resolve_ffmpeg_bin, run_ffmpeg
 from clone_narration_video.utils.json_io import read_json, write_json
+from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir, relpath, resolve_existing_path
 from clone_narration_video.utils.tts.edge.edge_tts_service import edge_tts_service
 
@@ -40,6 +40,31 @@ def _now_us() -> int:
 def _safe_name(value: str, fallback: str) -> str:
     safe = re.sub(r'[<>:"/\\|?*\r\n\t]+', "_", (value or "").strip()).strip(" .")
     return safe or fallback
+
+
+def _default_jianying_draft_root() -> Path | None:
+    candidates: list[Path] = []
+    if sys.platform.startswith("win"):
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            candidates.extend(
+                [
+                    Path(local_app_data) / "JianyingPro" / "User Data" / "Projects" / "com.lveditor.draft",
+                    Path(local_app_data) / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft",
+                ]
+            )
+    elif sys.platform == "darwin":
+        home = Path.home()
+        candidates.extend(
+            [
+                home / "Movies" / "JianyingPro" / "User Data" / "Projects" / "com.lveditor.draft",
+                home / "Movies" / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft",
+            ]
+        )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+    return None
 
 
 def _quote_concat_path(path: Path) -> str:
@@ -261,11 +286,16 @@ async def synthesize_timeline_audio(
     proxy: str | None,
     concurrency: int,
     reuse: bool,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     audio_dir = output_dir / "audio"
     sem = asyncio.Semaphore(max(1, int(concurrency)))
+    total = len(items)
+    completed = 0
+    lock = asyncio.Lock()
 
     async def run(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        nonlocal completed
         async with sem:
             key = str(item.get("item_id") or item.get("segment_id") or uuid.uuid4().hex[:8])
             result = await _synthesize_one(
@@ -277,6 +307,10 @@ async def synthesize_timeline_audio(
                 reuse=reuse,
             )
             print(f"[tts] {key} {result['duration']:.3f}s")
+            async with lock:
+                completed += 1
+                if progress_callback:
+                    progress_callback((completed / max(1, total)) * 100.0, f"Synthesized audio {completed}/{total}")
             return key, result
 
     pairs = await asyncio.gather(*(run(item) for item in items))
@@ -396,6 +430,7 @@ def render_video(
     *,
     output_name: str,
     encoder: str,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     tmp_dir = output_dir / "tmp_video"
     if tmp_dir.exists():
@@ -405,6 +440,7 @@ def render_video(
     selected_encoder = _select_video_encoder(encoder)
     print(f"[video] encoder={selected_encoder}")
 
+    total_items = len(items)
     for item_index, item in enumerate(items, start=1):
         key = str(item.get("item_id") or item.get("segment_id") or f"item_{item_index:03d}")
         audio = audio_results[key]
@@ -430,9 +466,15 @@ def render_video(
         _mux_item_with_audio(visual_path, audio_path, item_path, audio_duration, encoder=selected_encoder)
         item_paths.append(item_path)
         print(f"[video] {key} clips={len(clip_paths)} {audio_duration:.3f}s")
+        if progress_callback:
+            progress_callback((item_index / max(1, total_items)) * 85.0, f"Rendered video segments {item_index}/{total_items}")
 
     output_path = output_dir / output_name
+    if progress_callback:
+        progress_callback(90.0, "Merging final video")
     _concat_videos(item_paths, output_path, reencode=True, encoder=selected_encoder)
+    if progress_callback:
+        progress_callback(100.0, "Video render complete")
     return {
         "output_video": relpath(output_path),
         "segments_count": len(item_paths),
@@ -586,9 +628,12 @@ def generate_jianying_draft(
     *,
     draft_name: str,
     target_draft_root: Path | None,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = target_draft_root or (output_dir / "jianying_drafts")
+    base_dir = target_draft_root or _default_jianying_draft_root()
+    if base_dir is None:
+        raise ValueError("未找到本机剪映/CapCut 草稿目录，请通过 --jianying-draft-dir 指定草稿根目录")
     draft_dir = base_dir / f"{_safe_name(draft_name, 'CloneNarration')}_{ts}_{uuid.uuid4().hex[:6]}"
     assets_video_dir = draft_dir / "assets" / "video"
     assets_audio_dir = draft_dir / "assets" / "audio"
@@ -604,6 +649,7 @@ def generate_jianying_draft(
     audio_segments: list[dict[str, Any]] = []
     timeline_cursor_us = 0
     first_video: Path | None = None
+    total_items = len(items)
 
     for item_index, item in enumerate(items, start=1):
         key = str(item.get("item_id") or item.get("segment_id") or f"item_{item_index:03d}")
@@ -699,8 +745,13 @@ def generate_jianying_draft(
             }
         )
 
+        if progress_callback and (item_index == 1 or item_index == total_items or item_index % 10 == 0):
+            progress_callback((item_index / max(1, total_items)) * 70.0, f"Built draft timeline {item_index}/{total_items}")
+
     if not first_video:
         raise ValueError("没有可用于草稿的视频素材")
+    if progress_callback:
+        progress_callback(78.0, "Writing draft metadata")
     video_meta = _probe_video_meta(first_video)
     now_us = _now_us()
     track_video_id = uuid.uuid4().hex
@@ -769,15 +820,12 @@ def generate_jianying_draft(
     except Exception:
         pass
 
-    zip_path = draft_dir.with_suffix(".zip")
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p in draft_dir.rglob("*"):
-            if p.is_file():
-                zf.write(p, str(p.relative_to(draft_dir)).replace("\\", "/"))
+    if progress_callback:
+        progress_callback(100.0, "Jianying draft complete")
 
     return {
         "draft_dir": relpath(draft_dir),
-        "draft_zip": relpath(zip_path),
+        "draft_root": relpath(draft_dir.parent),
         "segments_count": len(items),
         "duration": _round(timeline_cursor_us / 1_000_000),
     }
@@ -818,6 +866,7 @@ async def async_main(args: argparse.Namespace) -> None:
         proxy=args.edge_proxy,
         concurrency=args.tts_concurrency,
         reuse=bool(args.reuse_tts),
+        progress_callback=lambda percent, message: emit_progress("render", percent * 0.35, message),
     )
 
     result: dict[str, Any] = {
@@ -834,6 +883,11 @@ async def async_main(args: argparse.Namespace) -> None:
             output_dir,
             draft_name=args.draft_name,
             target_draft_root=draft_root,
+            progress_callback=lambda percent, message: emit_progress(
+                "render",
+                35.0 + percent * (30.0 if args.mode == "both" else 65.0) / 100.0,
+                message,
+            ),
         )
     if args.mode in {"video", "both"}:
         result["rendered_video"] = render_video(
@@ -842,9 +896,15 @@ async def async_main(args: argparse.Namespace) -> None:
             output_dir,
             output_name=args.video_output_name,
             encoder=args.video_encoder,
+            progress_callback=lambda percent, message: emit_progress(
+                "render",
+                (65.0 if args.mode == "both" else 35.0) + percent * (35.0 if args.mode == "both" else 65.0) / 100.0,
+                message,
+            ),
         )
 
     manifest = write_manifest(output_dir, result)
+    emit_progress("render", 100, "Video generation complete")
     print(manifest)
 
 

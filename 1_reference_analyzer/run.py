@@ -12,6 +12,7 @@ from utils.cli_bootstrap import add_project_to_syspath
 add_project_to_syspath()
 
 from clone_narration_video.utils.json_io import read_json, write_json
+from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 from clone_narration_video.utils.shot_detection import detect_shots
 from clone_narration_video.utils.subtitle_tools import copy_or_create_srt, extract_srt_with_bcut
@@ -35,6 +36,7 @@ def analyze_reference_video(
 
     ref_id = ref_video_id or f"ref_{uuid.uuid4().hex[:8]}"
     srt_out = out_dir / "ref_subtitle.srt"
+    emit_progress("reference", 3, "Preparing reference subtitles")
     if subtitle_srt:
         copy_or_create_srt(subtitle_srt, srt_out)
     elif asr_provider == "none":
@@ -50,7 +52,9 @@ def analyze_reference_video(
         keyframe_dir=out_dir / "keyframes",
         threshold=threshold,
         backend=backend,
+        progress_callback=lambda percent, message: emit_progress("reference", 10.0 + percent * 0.9, message),
     )
+    emit_progress("reference", 100, "Reference analysis complete")
     result = {
         "ref_video_id": ref_id,
         "ref_video_path": str(video),

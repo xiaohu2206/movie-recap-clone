@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.cli_bootstrap import add_project_to_syspath
@@ -16,6 +16,7 @@ add_project_to_syspath()
 
 from clone_narration_video.utils.ai import AIModelConfig, ChatMessage, CustomOpenAIProvider
 from clone_narration_video.utils.json_io import read_json, write_json
+from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 
 
@@ -123,7 +124,11 @@ async def rewrite_script(
     model: str,
     temperature: float,
     batch_size: int,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
+    api_key = (api_key or "").strip()
+    base_url = (base_url or "").strip()
+    model = (model or "").strip()
     if not api_key:
         raise ValueError("缺少 AI API Key")
 
@@ -139,8 +144,11 @@ async def rewrite_script(
     rewritten: list[dict[str, Any]] = []
 
     try:
+        total = len(script_mapping)
         for start in range(0, len(script_mapping), max(1, batch_size)):
             batch = script_mapping[start : start + max(1, batch_size)]
+            if progress_callback:
+                progress_callback((start / max(1, total)) * 100.0, f"Rewriting batch {start + 1}-{start + len(batch)} of {total}")
             ai_rows = await _call_ai_batch(provider, batch)
 
             for item in batch:
@@ -163,6 +171,9 @@ async def rewrite_script(
                         "rewrite_status": "ai_rewritten",
                     }
                 )
+            if progress_callback:
+                done = min(total, start + len(batch))
+                progress_callback((done / max(1, total)) * 100.0, f"Rewritten segments {done}/{total}")
     finally:
         await provider.close()
 
@@ -204,6 +215,9 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=float(os.getenv("CLONE_AI_TEMPERATURE", "0.7")))
     parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
+    args.api_key = (args.api_key or "").strip()
+    args.base_url = (args.base_url or "").strip()
+    args.model = (args.model or "").strip()
 
     data = read_json(args.script_mapping)
     script_mapping = data.get("script_mapping") or []
@@ -220,6 +234,7 @@ def main() -> None:
             model=args.model,
             temperature=args.temperature,
             batch_size=args.batch_size,
+            progress_callback=lambda percent, message: emit_progress("rewrite", percent, message),
         )
     )
     out = write_json(Path(args.output_dir) / "rewritten_script.json", result)

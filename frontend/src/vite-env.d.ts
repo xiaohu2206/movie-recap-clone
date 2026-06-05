@@ -6,7 +6,7 @@ export type DialogFileOptions = {
 };
 
 export type PipelineEvent =
-  | { type: "started"; at: string; command: string; outputRoot: string }
+  | { type: "started"; at: string; command: string; outputRoot: string; logPath?: string }
   | { type: "stdout"; text: string }
   | { type: "stderr"; text: string }
   | { type: "error"; error: string; at: string }
@@ -20,12 +20,26 @@ export type BackendInfo = {
   hasLocalVenv: boolean;
 };
 
+export type PipelineState = {
+  ok: boolean;
+  outputRoot: string;
+  logPath?: string;
+  completed: boolean;
+  canResume: boolean;
+  completedStages: string[];
+};
+
 declare global {
   interface Window {
     cloneApp: {
       selectFile: (options?: DialogFileOptions) => Promise<string>;
       selectDirectory: () => Promise<string>;
-      startPipeline: (config: unknown) => Promise<{ ok: boolean; error?: string; outputRoot?: string }>;
+      detectJianyingDraftDir: () => Promise<string>;
+      loadConfig: () => Promise<Record<string, unknown> | null>;
+      saveConfig: (config: unknown) => Promise<{ ok: boolean; error?: string }>;
+      testAi: (config: unknown) => Promise<{ ok: boolean; model?: string; error?: string }>;
+      startPipeline: (config: unknown) => Promise<{ ok: boolean; error?: string; outputRoot?: string; logPath?: string }>;
+      getPipelineState: (config: unknown) => Promise<PipelineState>;
       stopPipeline: () => Promise<{ ok: boolean }>;
       revealPath: (targetPath: string) => Promise<boolean>;
       openPath: (targetPath: string) => Promise<boolean>;

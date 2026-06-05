@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.cli_bootstrap import add_project_to_syspath
@@ -11,6 +11,7 @@ from utils.cli_bootstrap import add_project_to_syspath
 add_project_to_syspath()
 
 from clone_narration_video.utils.json_io import read_json, write_json
+from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 
 
@@ -25,6 +26,8 @@ def _role(index: int, total: int) -> str:
 def bind_script_visual(
     narration_segments: list[dict[str, Any]],
     ref_to_movie_timeline: list[dict[str, Any]],
+    *,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     by_ref = {str(x.get("ref_shot_id")): x for x in ref_to_movie_timeline if x.get("ref_shot_id")}
     script_mapping = []
@@ -54,6 +57,9 @@ def bind_script_visual(
                 "text_role": seg.get("text_role") or _role(idx, total),
             }
         )
+        current = idx + 1
+        if progress_callback and (current == 1 or current == total or current % 10 == 0):
+            progress_callback((current / max(1, total)) * 100.0, f"Bound script segments {current}/{total}")
     return {"script_mapping": script_mapping}
 
 
@@ -69,6 +75,7 @@ def main() -> None:
     result = bind_script_visual(
         seg_data.get("narration_segments") or [],
         timeline_data.get("ref_to_movie_timeline") or [],
+        progress_callback=lambda percent, message: emit_progress("binder", percent, message),
     )
     out = write_json(Path(args.output_dir) / "script_mapping.json", result)
     print(out)

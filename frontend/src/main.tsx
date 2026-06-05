@@ -12,6 +12,7 @@ import {
   GearSix,
   Info,
   Lightning,
+  MagnifyingGlass,
   Play,
   Prohibit,
   Queue,
@@ -50,7 +51,19 @@ type PipelineConfig = {
   videoEncoder: VideoEncoder;
 };
 
+type PipelineRunMode = "normal" | "resume" | "restart";
+
+type PipelineResumeState = {
+  outputRoot: string;
+  completedStages: string[];
+};
+
 type StageState = "waiting" | "running" | "done" | "failed" | "skipped";
+
+type StageProgress = {
+  percent: number;
+  message: string;
+};
 
 type Stage = {
   id: string;
@@ -165,7 +178,18 @@ const defaultConfig: PipelineConfig = {
 const previewBridge = {
   selectFile: async () => "",
   selectDirectory: async () => "",
+  detectJianyingDraftDir: async () => "",
+  loadConfig: async () => null,
+  saveConfig: async () => ({ ok: true }),
+  testAi: async () => ({ ok: false, error: "当前是浏览器预览模式，请在 Electron 中测试连接。" }),
   startPipeline: async () => ({ ok: false, error: "当前是浏览器预览模式，请在 Electron 中运行生成任务。" }),
+  getPipelineState: async () => ({
+    ok: true,
+    outputRoot: "",
+    completed: false,
+    canResume: false,
+    completedStages: [],
+  }),
   stopPipeline: async () => ({ ok: true }),
   revealPath: async () => false,
   openPath: async () => false,
@@ -225,12 +249,24 @@ function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [startedAt, setStartedAt] = useState<Date | null>(null);
   const [finishedCode, setFinishedCode] = useState<number | null>(null);
+  const [resumeState, setResumeState] = useState<PipelineResumeState | null>(null);
+  const [pipelineLogPath, setPipelineLogPath] = useState("");
   const [logLines, setLogLines] = useState<LogLine[]>([
     { id: 1, level: "system", text: "工作台已就绪。请选择参考视频和原片后启动流水线。" },
   ]);
   const [stageStates, setStageStates] = useState<Record<string, StageState>>(() => createStageStates(defaultConfig.renderMode));
+  const [stageProgress, setStageProgress] = useState<Record<string, StageProgress>>({});
+  const [aiTest, setAiTest] = useState<{ status: "idle" | "testing" | "ok" | "error"; message: string }>({
+    status: "idle",
+    message: "",
+  });
+  const [draftDetect, setDraftDetect] = useState<{ status: "idle" | "detecting" | "found" | "missing"; message: string }>({
+    status: "idle",
+    message: "",
+  });
   const nextLogId = useRef(2);
   const logRef = useRef<HTMLDivElement>(null);
+  const configLoaded = useRef(false);
 
   useEffect(() => {
     cloneBridge.getBackendInfo().then((info) => {
@@ -246,19 +282,19 @@ function App() {
         setIsRunning(true);
         setStartedAt(new Date());
         setFinishedCode(null);
+        setPipelineLogPath(event.logPath || `${event.outputRoot}\\logs\\pipeline.log`);
         setStageStates(createStageStates(config.renderMode));
+        setStageProgress({});
         pushLog("system", `启动命令: ${event.command}`);
         pushLog("system", `输出目录: ${event.outputRoot}`);
       }
 
       if (event.type === "stdout") {
         appendChunk("info", event.text);
-        markStageFromText(event.text);
       }
 
       if (event.type === "stderr") {
         appendChunk("error", event.text);
-        markStageFromText(event.text);
       }
 
       if (event.type === "error") {
@@ -286,6 +322,16 @@ function App() {
             stages.map((stage) => [stage.id, isStageEnabled(stage, config.renderMode) ? "done" : "skipped"]),
           ) as Record<string, StageState>;
         });
+        if (event.code === 0) {
+          setStageProgress((previous) =>
+            Object.fromEntries(
+              stages.map((stage) => [
+                stage.id,
+                previous[stage.id] ?? { percent: isStageEnabled(stage, config.renderMode) ? 100 : 0, message: "" },
+              ]),
+            ) as Record<string, StageProgress>,
+          );
+        }
         pushLog(event.code === 0 ? "system" : "error", event.code === 0 ? "流水线完成。" : `流水线退出，代码 ${event.code}`);
       }
     });
@@ -298,6 +344,34 @@ function App() {
       logRef.current.scrollTop = logRef.current.scrollHeight;
     }
   }, [logLines]);
+
+  useEffect(() => {
+    let cancelled = false;
+    cloneBridge.loadConfig().then((saved) => {
+      if (!cancelled && saved && typeof saved === "object") {
+        setConfig((prev) => ({ ...prev, ...(saved as Partial<PipelineConfig>) }));
+      }
+      configLoaded.current = true;
+      const savedDraftDir =
+        saved && typeof saved === "object" ? String((saved as Partial<PipelineConfig>).jianyingDraftDir || "") : "";
+      if (!cancelled && !savedDraftDir) {
+        void detectDraftDir(false);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!configLoaded.current) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      cloneBridge.saveConfig(config);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [config]);
 
   function pushLog(level: LogLine["level"], text: string) {
     const clean = text.trim();
@@ -312,7 +386,42 @@ function App() {
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean)
-      .forEach((line) => pushLog(level, line));
+      .forEach((line) => {
+        if (handleProgressLine(line)) {
+          return;
+        }
+        pushLog(level, line);
+        markStageFromText(line);
+      });
+  }
+
+  function handleProgressLine(line: string) {
+    const match = line.match(/^\[progress\]\s+(.+)$/);
+    if (!match) {
+      return false;
+    }
+    try {
+      const payload = JSON.parse(match[1]) as Partial<StageProgress> & { stage?: string };
+      const stageId = String(payload.stage || "");
+      const stage = stages.find((item) => item.id === stageId);
+      if (!stage) {
+        return true;
+      }
+      const percent = Math.max(0, Math.min(100, Number(payload.percent ?? 0)));
+      const message = String(payload.message || "");
+      setStageProgress((previous) => ({
+        ...previous,
+        [stageId]: { percent, message },
+      }));
+      setStageStates((previous) => ({
+        ...previous,
+        [stageId]: percent >= 100 ? "done" : "running",
+      }));
+      pushLog("info", `${stage.title}: ${message}${Number.isFinite(percent) ? ` (${Math.round(percent)}%)` : ""}`);
+    } catch {
+      pushLog("info", line);
+    }
+    return true;
   }
 
   function markStageFromText(text: string) {
@@ -375,10 +484,28 @@ function App() {
     const selected = await cloneBridge.selectDirectory();
     if (selected) {
       updateConfig(key, selected);
+      if (key === "jianyingDraftDir") {
+        setDraftDetect({ status: "found", message: "已设置剪映草稿目录" });
+      }
     }
   }
 
-  async function startPipeline() {
+  async function detectDraftDir(manual: boolean) {
+    setDraftDetect({ status: "detecting", message: "正在查找本机剪映草稿目录…" });
+    try {
+      const found = await cloneBridge.detectJianyingDraftDir();
+      if (found) {
+        updateConfig("jianyingDraftDir", found);
+        setDraftDetect({ status: "found", message: manual ? "已重新定位剪映草稿目录" : "已自动定位剪映草稿目录" });
+      } else {
+        setDraftDetect({ status: "missing", message: "未找到剪映草稿目录，请手动选择保存文件夹。" });
+      }
+    } catch (error) {
+      setDraftDetect({ status: "missing", message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  async function startPipeline(runMode: PipelineRunMode = "normal") {
     if (!config.refVideoPath || !config.moviePath) {
       pushLog("error", "请先选择参考视频和原片。");
       setActiveTab("setup");
@@ -386,14 +513,53 @@ function App() {
     }
 
     setActiveTab("pipeline");
-    const result = await cloneBridge.startPipeline(config);
+    setResumeState(null);
+    const result = await cloneBridge.startPipeline({ ...config, runMode });
     if (!result.ok) {
       pushLog("error", result.error || "启动失败。");
+    } else if (result.logPath) {
+      setPipelineLogPath(result.logPath);
     }
+  }
+
+  async function handleStartClick() {
+    if (!config.refVideoPath || !config.moviePath) {
+      await startPipeline();
+      return;
+    }
+
+    const state = await cloneBridge.getPipelineState(config);
+    if (state.canResume) {
+      setResumeState({
+        outputRoot: state.outputRoot,
+        completedStages: state.completedStages,
+      });
+      return;
+    }
+
+    await startPipeline("normal");
   }
 
   async function stopPipeline() {
     await cloneBridge.stopPipeline();
+  }
+
+  async function testAiConnection() {
+    setAiTest({ status: "testing", message: "正在测试连接…" });
+    try {
+      const result = await cloneBridge.testAi({
+        aiApiKey: config.aiApiKey,
+        aiBaseUrl: config.aiBaseUrl,
+        aiModel: config.aiModel,
+      });
+      if (result.ok) {
+        setAiTest({ status: "ok", message: `连接成功，模型 ${result.model || config.aiModel}` });
+      } else {
+        setAiTest({ status: "error", message: result.error || "连接失败" });
+      }
+    } catch (error) {
+      setAiTest({ status: "error", message: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   const activeStageCount = useMemo(() => stages.filter((stage) => isStageEnabled(stage, config.renderMode)).length, [config.renderMode]);
@@ -401,8 +567,29 @@ function App() {
     () => stages.filter((stage) => isStageEnabled(stage, config.renderMode) && stageStates[stage.id] === "done").length,
     [config.renderMode, stageStates],
   );
-  const progress = Math.round((completedCount / activeStageCount) * 100);
+  const progressUnits = useMemo(
+    () =>
+      stages.reduce((sum, stage) => {
+        if (!isStageEnabled(stage, config.renderMode)) {
+          return sum;
+        }
+        if (stageStates[stage.id] === "done") {
+          return sum + 1;
+        }
+        if (stageStates[stage.id] === "running") {
+          return sum + Math.max(0, Math.min(100, stageProgress[stage.id]?.percent ?? 0)) / 100;
+        }
+        return sum;
+      }, 0),
+    [config.renderMode, stageProgress, stageStates],
+  );
+  const progress = Math.round((progressUnits / activeStageCount) * 100);
   const canStart = config.refVideoPath && config.moviePath && !isRunning;
+
+  const videoOutputFullPath = outputPath(config.outputRoot, "outputs/8_generate_video");
+  const jianyingDraftFullPath = config.jianyingDraftDir
+    ? config.jianyingDraftDir
+    : outputPath(config.outputRoot, "outputs/8_generate_video/jianying_drafts");
 
   return (
     <div className="app-shell">
@@ -463,12 +650,38 @@ function App() {
                 <Stop weight="fill" /> 停止
               </button>
             ) : (
-              <button className="primary-button" onClick={startPipeline} disabled={!canStart}>
+              <button className="primary-button" onClick={handleStartClick} disabled={!canStart}>
                 <Play weight="fill" /> 开始生成
               </button>
             )}
           </div>
         </header>
+
+        {resumeState && (
+          <div className="resume-dialog-backdrop" role="presentation">
+            <div className="resume-dialog" role="dialog" aria-modal="true" aria-labelledby="resume-dialog-title">
+              <div>
+                <p className="section-label">检测到未完成任务</p>
+                <h2 id="resume-dialog-title">要继续生成还是重新生成？</h2>
+                <p>
+                  已在当前输出目录找到 {resumeState.completedStages.length} 个阶段产物。继续生成会复用已有产物，重新生成会清理阶段产物并从头开始。
+                </p>
+                <small>{resumeState.outputRoot}</small>
+              </div>
+              <div className="resume-dialog-actions">
+                <button className="ghost-button" onClick={() => setResumeState(null)}>
+                  取消
+                </button>
+                <button className="danger-button" onClick={() => startPipeline("restart")}>
+                  <ArrowCounterClockwise /> 重新生成
+                </button>
+                <button className="primary-button" onClick={() => startPipeline("resume")}>
+                  <Play weight="fill" /> 继续生成
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {activeTab === "setup" && (
           <section className="content-grid setup-grid">
@@ -541,6 +754,60 @@ function App() {
               </div>
             </div>
 
+            <div className="panel full-panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="section-label">剪映草稿</p>
+                  <h2>草稿保存目录</h2>
+                </div>
+                <button
+                  className="ghost-button"
+                  onClick={() => detectDraftDir(true)}
+                  disabled={draftDetect.status === "detecting"}
+                >
+                  {draftDetect.status === "detecting" ? <CircleNotch className="spin" /> : <MagnifyingGlass weight="bold" />}
+                  自动查找
+                </button>
+              </div>
+              <p className="panel-hint">
+                软件启动时会自动查找本机剪映 / CapCut 草稿目录并记住；找到后下次启动不再修改。若未找到，请手动选择要保存草稿的文件夹。
+              </p>
+              <div className="draft-dir-field">
+                <div className="input-with-action">
+                  <input
+                    value={config.jianyingDraftDir}
+                    placeholder="例如 C:\\Users\\你\\AppData\\Local\\JianyingPro\\User Data\\Projects\\com.lveditor.draft"
+                    onChange={(event) => updateConfig("jianyingDraftDir", event.target.value)}
+                  />
+                  <button onClick={() => chooseDirectory("jianyingDraftDir")} title="选择文件夹">
+                    <Folder />
+                  </button>
+                </div>
+                {config.jianyingDraftDir && (
+                  <button
+                    className="ghost-button draft-clear"
+                    onClick={() => {
+                      updateConfig("jianyingDraftDir", "");
+                      setDraftDetect({ status: "idle", message: "" });
+                    }}
+                  >
+                    <Prohibit /> 清除
+                  </button>
+                )}
+              </div>
+              {draftDetect.status !== "idle" && (
+                <p className={cx("draft-detect-status", draftDetect.status)}>
+                  {draftDetect.status === "found" && <CheckCircle weight="fill" />}
+                  {draftDetect.status === "missing" && <WarningCircle weight="fill" />}
+                  {draftDetect.status === "detecting" && <CircleNotch className="spin" />}
+                  <span>
+                    {draftDetect.message}
+                    {draftDetect.status === "found" && config.jianyingDraftDir ? `：${config.jianyingDraftDir}` : ""}
+                  </span>
+                </p>
+              )}
+            </div>
+
             <div className="panel">
               <div className="panel-heading compact">
                 <div>
@@ -566,6 +833,18 @@ function App() {
                   模型
                   <input value={config.aiModel} onChange={(event) => updateConfig("aiModel", event.target.value)} />
                 </label>
+                <div className="ai-test-row">
+                  <button className="ghost-button" onClick={testAiConnection} disabled={aiTest.status === "testing"}>
+                    {aiTest.status === "testing" ? <CircleNotch className="spin" /> : <Lightning weight="fill" />} 测试连接
+                  </button>
+                  {aiTest.status !== "idle" && (
+                    <p className={cx("ai-test-status", aiTest.status)}>
+                      {aiTest.status === "ok" && <CheckCircle weight="fill" />}
+                      {aiTest.status === "error" && <WarningCircle weight="fill" />}
+                      <span>{aiTest.message}</span>
+                    </p>
+                  )}
+                </div>
               </div>
             </div>
 
@@ -587,13 +866,6 @@ function App() {
                   Edge Voice ID
                   <input value={config.edgeVoiceId} onChange={(event) => updateConfig("edgeVoiceId", event.target.value)} />
                 </label>
-                <label>
-                  剪映草稿目录
-                  <div className="input-with-action">
-                    <input value={config.jianyingDraftDir} placeholder="可选" onChange={(event) => updateConfig("jianyingDraftDir", event.target.value)} />
-                    <button onClick={() => chooseDirectory("jianyingDraftDir")}><Folder /></button>
-                  </div>
-                </label>
               </div>
             </div>
           </section>
@@ -607,6 +879,7 @@ function App() {
                   key={stage.id}
                   stage={stage}
                   state={stageStates[stage.id]}
+                  progress={stageProgress[stage.id]}
                   targetPath={outputPath(config.outputRoot, stage.output)}
                 />
               ))}
@@ -618,7 +891,15 @@ function App() {
                   <p className="section-label">实时日志</p>
                   <h2>运行反馈</h2>
                 </div>
-                <TerminalWindow />
+                <div className="log-actions">
+                  <button title="打开日志" onClick={() => cloneBridge.openPath(pipelineLogPath)} disabled={!pipelineLogPath}>
+                    <File />
+                  </button>
+                  <button title="定位日志" onClick={() => cloneBridge.revealPath(pipelineLogPath)} disabled={!pipelineLogPath}>
+                    <Folder />
+                  </button>
+                  <TerminalWindow />
+                </div>
               </div>
               <div className="log-body" ref={logRef}>
                 {logLines.map((line) => (
@@ -645,17 +926,25 @@ function App() {
               </button>
             </div>
 
-            {stages.map((stage) => (
+            <button
+              className="output-tile"
+              onClick={() => cloneBridge.openPath(videoOutputFullPath)}
+            >
+              <span>视频</span>
+              <strong>直出视频</strong>
+              <small>{videoOutputFullPath}</small>
+            </button>
+
+            {(config.renderMode === "draft" || config.renderMode === "both") && (
               <button
-                key={stage.id}
                 className="output-tile"
-                onClick={() => cloneBridge.revealPath(outputPath(config.outputRoot, stage.output))}
+                onClick={() => cloneBridge.openPath(jianyingDraftFullPath)}
               >
-                <span>{String(stage.step).padStart(2, "0")}</span>
-                <strong>{stage.title}</strong>
-                <small>{outputPath(config.outputRoot, stage.output)}</small>
+                <span>草稿</span>
+                <strong>剪映草稿</strong>
+                <small>{jianyingDraftFullPath}</small>
               </button>
-            ))}
+            )}
           </section>
         )}
       </main>
@@ -754,7 +1043,17 @@ function NumberField(props: {
   );
 }
 
-function StageRow({ stage, state, targetPath }: { stage: Stage; state: StageState; targetPath: string }) {
+function StageRow({
+  stage,
+  state,
+  progress,
+  targetPath,
+}: {
+  stage: Stage;
+  state: StageState;
+  progress?: StageProgress;
+  targetPath: string;
+}) {
   const icon = {
     waiting: <ClockCounterClockwise />,
     running: <CircleNotch className="spin" />,
@@ -762,14 +1061,27 @@ function StageRow({ stage, state, targetPath }: { stage: Stage; state: StageStat
     failed: <WarningCircle weight="fill" />,
     skipped: <Prohibit />,
   }[state];
+  const percent = Math.round(Math.max(0, Math.min(100, progress?.percent ?? (state === "done" ? 100 : 0))));
+  const showProgress = state === "running" || (progress && percent > 0 && state !== "skipped");
 
   return (
     <article className={cx("stage-row", state)}>
       <div className="stage-index">{String(stage.step).padStart(2, "0")}</div>
       <div className="stage-main">
-        <div>
+        <div className="stage-copy">
           <strong>{stage.title}</strong>
           <span>{stage.detail}</span>
+          {showProgress && (
+            <div className="stage-progress">
+              <div className="stage-progress-meta">
+                <small>{progress?.message || stateText(state)}</small>
+                <small>{percent}%</small>
+              </div>
+              <div className="stage-progress-track">
+                <i style={{ width: `${percent}%` }} />
+              </div>
+            </div>
+          )}
         </div>
         <button onClick={() => cloneBridge.revealPath(targetPath)}>
           <Export /> 定位产物

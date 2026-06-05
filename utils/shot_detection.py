@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -11,6 +11,8 @@ from .project_paths import MODEL_DIR
 from .video_tools import extract_frame, video_info
 
 logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[float, str], None]
 
 
 def _shot_id(prefix: str, idx: int) -> str:
@@ -32,21 +34,39 @@ def _normalize_scenes(scenes: np.ndarray, frame_count: int, min_frames: int) -> 
     return out or [(0, max(0, frame_count - 1))]
 
 
-def _detect_with_transnet(video_path: str | Path, threshold: float) -> tuple[list[tuple[int, int]], int, dict[str, Any]]:
+def _detect_with_transnet(
+    video_path: str | Path,
+    threshold: float,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[tuple[int, int]], int, dict[str, Any]]:
     from .transnetv2_torch import TransNetV2Torch
 
     model = TransNetV2Torch(str(MODEL_DIR))
-    frames, single, many = model.predict_video(str(video_path))
+    if progress_callback:
+        progress_callback(1.0, "Loading TransNetV2 model")
+
+    def on_model_progress(percent: float) -> None:
+        if progress_callback:
+            progress_callback(2.0 + min(100.0, max(0.0, percent)) * 0.78, "Detecting shot boundaries")
+
+    frames, single, many = model.predict_video(str(video_path), progress_callback=on_model_progress)
     preds = many if many is not None and len(many) else single
     scenes = model.predictions_to_scenes(preds, threshold=threshold)
+    if progress_callback:
+        progress_callback(82.0, f"Detected {len(scenes)} raw shot boundaries")
     return _normalize_scenes(scenes, len(frames), 2), len(frames), model.get_backend_info()
 
 
-def _detect_with_frame_diff(video_path: str | Path, threshold: float) -> tuple[list[tuple[int, int]], int, dict[str, Any]]:
+def _detect_with_frame_diff(
+    video_path: str | Path,
+    threshold: float,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[tuple[int, int]], int, dict[str, Any]]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     scores: list[float] = []
     frames: list[int] = []
     prev_gray = None
@@ -75,6 +95,8 @@ def _detect_with_frame_diff(video_path: str | Path, threshold: float) -> tuple[l
             prev_hist = hist
             prev_edge = edge
             idx += 1
+            if progress_callback and total_frames > 0 and (idx == 1 or idx % 300 == 0):
+                progress_callback(min(82.0, (idx / total_frames) * 82.0), "Scanning frames with OpenCV")
     finally:
         cap.release()
 
@@ -123,15 +145,16 @@ def detect_shots(
     keyframe_dir: str | Path,
     threshold: float = 0.5,
     backend: str = "auto",
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     info = video_info(video_path)
     fps = max(1e-6, float(info.get("fps") or 25.0))
     duration = float(info.get("duration") or 0.0)
     backend_info: dict[str, Any]
     if backend == "opencv":
-        scenes, frame_count, backend_info = _detect_with_frame_diff(video_path, threshold)
+        scenes, frame_count, backend_info = _detect_with_frame_diff(video_path, threshold, progress_callback)
     else:
-        scenes, frame_count, backend_info = _detect_with_transnet(video_path, threshold)
+        scenes, frame_count, backend_info = _detect_with_transnet(video_path, threshold, progress_callback)
 
     min_frames = max(2, int(round(fps * 0.15)))
     scenes = _normalize_scenes(np.array(scenes, dtype=np.int32), frame_count, min_frames)
@@ -139,6 +162,9 @@ def detect_shots(
     key_dir = Path(keyframe_dir)
     key_dir.mkdir(parents=True, exist_ok=True)
     shots = []
+    total_scenes = len(scenes)
+    if progress_callback:
+        progress_callback(84.0, f"Exporting {total_scenes} keyframes")
     for idx, (start_f, end_f) in enumerate(scenes, start=1):
         start = max(0.0, start_f / fps)
         end = min(duration or ((end_f + 1) / fps), (end_f + 1) / fps)
@@ -158,6 +184,9 @@ def detect_shots(
                 "end_frame": int(end_f),
             }
         )
+        if progress_callback and (idx == 1 or idx == total_scenes or idx % 10 == 0):
+            percent = 84.0 + (idx / max(1, total_scenes)) * 16.0
+            progress_callback(percent, f"Exported keyframes {idx}/{total_scenes}")
 
     return {
         "duration": round(duration, 3),
