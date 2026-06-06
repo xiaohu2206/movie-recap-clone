@@ -289,7 +289,28 @@ def _unique_keep_order(values: list[str]) -> list[str]:
     return out
 
 
-def select_keyframes(item: dict[str, Any], max_frames: int = 3) -> list[str]:
+def interior_sample_positions(count: int) -> list[float]:
+    """在 (0, 1) 内采样，避开镜头首尾。
+
+    count=4 时把镜头均分为 5 段，取 1/5、2/5、3/5、4/5 位置。
+    """
+    count = max(1, int(count))
+    if count == 1:
+        return [0.5]
+    segments = count + 1
+    return [i / segments for i in range(1, segments)]
+
+
+def _index_at_interior_position(length: int, position: float) -> int:
+    if length <= 1:
+        return 0
+    if length == 2:
+        return 0
+    raw = int(round(position * (length - 1)))
+    return max(1, min(length - 2, raw))
+
+
+def select_keyframes(item: dict[str, Any], max_frames: int = 4) -> list[str]:
     frames = item.get("keyframes")
     if not isinstance(frames, list) or not frames:
         return []
@@ -299,34 +320,35 @@ def select_keyframes(item: dict[str, Any], max_frames: int = 3) -> list[str]:
         return []
 
     max_frames = max(1, int(max_frames))
-    if len(cleaned) <= max_frames:
+    if len(cleaned) <= 2:
+        return _unique_keep_order(cleaned)
+    if len(cleaned) == max_frames:
         return _unique_keep_order(cleaned)
 
-    if max_frames == 1:
-        mid = len(cleaned) // 2
-        return [cleaned[mid]]
-
-    picks = [0, len(cleaned) // 2, len(cleaned) - 1]
-    if max_frames > 3:
-        step = (len(cleaned) - 1) / float(max_frames - 1)
-        picks = [round(i * step) for i in range(max_frames)]
-    return _unique_keep_order([cleaned[int(i)] for i in picks])
+    positions = interior_sample_positions(max_frames)
+    picks: list[int] = []
+    seen_indexes: set[int] = set()
+    for position in positions:
+        index = _index_at_interior_position(len(cleaned), position)
+        if index in seen_indexes:
+            continue
+        seen_indexes.add(index)
+        picks.append(index)
+    return _unique_keep_order([cleaned[index] for index in picks])
 
 
 def _frame_role(index: int, total: int) -> str:
     if total <= 1:
         return "middle"
-    if index == 0:
-        return "start"
-    if index == total - 1:
-        return "end"
+    if total == 4:
+        return f"fifth_{index + 1}"
     return "middle"
 
 
 def build_shot_feature(
     item: dict[str, Any],
     *,
-    max_frames: int = 3,
+    max_frames: int = 4,
     feature_mode: str = "classic",
 ) -> dict[str, Any]:
     frames = select_keyframes(item, max_frames=max_frames)

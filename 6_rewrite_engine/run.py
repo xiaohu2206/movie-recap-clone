@@ -19,6 +19,8 @@ from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 
+# 大写配置-是否用大模型生成仿稿
+USE_AI_REWRITE = False  # 默认 False：直接沿用原稿；True 时调用大模型改写
 
 SYSTEM_PROMPT = """你是影视解说仿稿助手。
 目标：基于旧文案结构，生成结构相似但表达不同的新文案。
@@ -116,6 +118,43 @@ async def _call_ai_batch(
     return result
 
 
+def pass_through_script(
+    script_mapping: list[dict[str, Any]],
+    *,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> dict[str, Any]:
+    rewritten: list[dict[str, Any]] = []
+    total = len(script_mapping)
+    for index, item in enumerate(script_mapping):
+        seg_id = str(item.get("segment_id") or "")
+        old_text = str(item.get("old_text") or item.get("text") or "")
+        role = str(item.get("text_role") or "narration")
+        rewritten.append(
+            {
+                "segment_id": seg_id,
+                "old_text": old_text,
+                "new_text": old_text,
+                "old_char_count": _char_len(old_text),
+                "new_char_count": _char_len(old_text),
+                "text_role": role,
+                "ref_time_range": item.get("ref_time_range") or {},
+                "movie_time_ranges": item.get("movie_time_ranges") or [],
+                "rewrite_status": "original",
+            }
+        )
+        if progress_callback:
+            done = index + 1
+            progress_callback((done / max(1, total)) * 100.0, f"Passed through segments {done}/{total}")
+
+    return {
+        "rewritten_script": rewritten,
+        "rewrite_backend": {
+            "provider": "passthrough",
+            "use_ai_rewrite": False,
+        },
+    }
+
+
 async def rewrite_script(
     script_mapping: list[dict[str, Any]],
     *,
@@ -183,6 +222,7 @@ async def rewrite_script(
             "provider": "custom_openai",
             "model": model,
             "batch_size": batch_size,
+            "use_ai_rewrite": True,
         },
     }
 
@@ -223,20 +263,26 @@ def main() -> None:
     script_mapping = data.get("script_mapping") or []
     if not isinstance(script_mapping, list):
         raise SystemExit("script_mapping.json 缺少 script_mapping 数组")
-    if not args.api_key:
-        raise SystemExit("缺少 AI API Key：请传 --api-key 或设置 CLONE_AI_API_KEY / OPENAI_API_KEY")
 
-    result = asyncio.run(
-        rewrite_script(
+    if USE_AI_REWRITE:
+        if not args.api_key:
+            raise SystemExit("缺少 AI API Key：请传 --api-key 或设置 CLONE_AI_API_KEY / OPENAI_API_KEY")
+        result = asyncio.run(
+            rewrite_script(
+                script_mapping,
+                api_key=args.api_key,
+                base_url=args.base_url,
+                model=args.model,
+                temperature=args.temperature,
+                batch_size=args.batch_size,
+                progress_callback=lambda percent, message: emit_progress("rewrite", percent, message),
+            )
+        )
+    else:
+        result = pass_through_script(
             script_mapping,
-            api_key=args.api_key,
-            base_url=args.base_url,
-            model=args.model,
-            temperature=args.temperature,
-            batch_size=args.batch_size,
             progress_callback=lambda percent, message: emit_progress("rewrite", percent, message),
         )
-    )
     out = write_json(Path(args.output_dir) / "rewritten_script.json", result)
     print(out)
 

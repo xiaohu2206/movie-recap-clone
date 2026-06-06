@@ -19,7 +19,9 @@ from clone_narration_video.utils.shot_detection import detect_shots
 from clone_narration_video.utils.visual_features import (
     compare_homography_frames,
     compare_normalized_frames,
+    interior_sample_positions,
     load_normalized_frame,
+    select_keyframes,
 )
 
 
@@ -48,6 +50,41 @@ def _write_image(path: Path, color: tuple[int, int, int], *, square: tuple[int, 
 
 
 class VisualAlignmentV3Tests(unittest.TestCase):
+    def test_interior_sample_positions_avoids_boundaries(self) -> None:
+        self.assertEqual(interior_sample_positions(4), [0.2, 0.4, 0.6, 0.8])
+
+    def test_select_keyframes_skips_first_and_last_when_more_frames_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [_write_image(root / f"frame_{idx}.jpg", (idx, idx, idx)) for idx in range(7)]
+            shot = {"keyframes": paths}
+            selected = select_keyframes(shot, max_frames=4)
+            self.assertEqual(len(selected), 4)
+            self.assertNotIn(paths[0], selected)
+            self.assertNotIn(paths[-1], selected)
+
+    def test_detect_shots_exports_four_keyframes_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video_path = root / "clip.mp4"
+            writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (96, 64))
+            for idx in range(30):
+                frame = np.full((64, 96, 3), 40 + idx, dtype=np.uint8)
+                writer.write(frame)
+            writer.release()
+
+            result = detect_shots(
+                video_path,
+                shot_prefix="ref_shot",
+                keyframe_dir=root / "keyframes",
+                backend="opencv",
+            )
+
+            shot = result["shots"][0]
+            self.assertEqual(len(shot["keyframes"]), 4)
+            self.assertEqual([row["position"] for row in shot["keyframe_times"]], [0.2, 0.4, 0.6, 0.8])
+            self.assertEqual([row["role"] for row in shot["keyframe_times"]], ["fifth_1", "fifth_2", "fifth_3", "fifth_4"])
+
     def test_detect_shots_exports_three_keyframes_and_optional_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

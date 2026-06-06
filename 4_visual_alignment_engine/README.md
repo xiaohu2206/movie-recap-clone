@@ -11,7 +11,7 @@ python .\clone_narration_video\4_visual_alignment_engine\run.py `
 新版默认使用多关键帧镜头级匹配、top-k 候选召回和全局路径优化。常用参数：
 
 ```powershell
---keyframes-per-shot 3
+--keyframes-per-shot 4
 --recall-top-k 80
 --rerank-top-k 20
 --top-n 8

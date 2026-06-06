@@ -192,7 +192,7 @@ def align_visual_timeline(
     *,
     top_n: int = 8,
     min_score: float = 0.35,
-    keyframes_per_shot: int = 3,
+    keyframes_per_shot: int = 4,
     recall_top_k: int = 80,
     rerank_top_k: int = 20,
     refine_top_k: int = 3,
@@ -371,7 +371,7 @@ def main() -> None:
     parser.add_argument("--output-dir", default=str(default_output_dir("4_visual_alignment_engine")))
     parser.add_argument("--top-n", type=int, default=8)
     parser.add_argument("--min-score", type=float, default=0.35)
-    parser.add_argument("--keyframes-per-shot", type=int, default=3)
+    parser.add_argument("--keyframes-per-shot", type=int, default=4)
     parser.add_argument("--recall-top-k", type=int, default=80)
     parser.add_argument("--rerank-top-k", type=int, default=20)
     parser.add_argument("--refine-top-k", type=int, default=3)

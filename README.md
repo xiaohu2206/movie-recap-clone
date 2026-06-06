@@ -117,6 +117,16 @@ frontend\release\win-unpacked\Clone Narration Studio.exe
 
 下面命令默认已经在 `clone_narration_video` 目录下，并已激活 `.venv`。
 
+也可以通过总入口只执行某一步，前置产物需要已经存在：
+
+```powershell
+python .\main.py --only-step 5 --output-root .\outputs
+python .\main.py --only-step audio --output-root .\outputs --movie-subtitle-srt .\data\movie.srt
+python .\main.py --only-step 6 --output-root .\outputs --ai-provider custom_openai
+```
+
+`--only-step` 支持 `1` 到 `8`，以及原声片段识别的 `audio` / `5a`。
+
 ### 1. 参考视频解析
 
 有现成字幕时推荐这样跑，速度最快：
@@ -222,6 +232,27 @@ python .\5_script_visual_binder\run.py `
 outputs\5_script_visual_binder\script_mapping.json
 ```
 
+### 5A. 原声片段识别
+
+
+没有原电影字幕时，可传 `--movie-path` 自动识别。该模式只会裁剪并识别 `script_mapping.json` 中已匹配到的电影镜头时间段，不会识别整部电影：
+
+```powershell
+python .\5_audio_role_classifier\run.py `
+  --script-mapping .\outputs\5_script_visual_binder\script_mapping.json `
+  --ref-analysis .\outputs\1_reference_analyzer\ref_analysis.json `
+  --movie-path .\data\movie.mp4 `
+  --output-dir .\outputs\5_audio_role_classifier
+```
+
+自动识别依赖 Bcut 网络服务，模块会默认重试 3 次；如果网络不稳定，直接传 `--movie-subtitle-srt` 更稳。可用 `--movie-asr-padding` 调整匹配镜头前后的额外识别秒数，用 `--movie-asr-merge-gap` 合并相邻小片段。
+
+输出：
+
+```text
+outputs\5_audio_role_classifier\script_mapping_with_audio.json
+```
+
 ### 6. 仿稿
 
 使用 AI：
@@ -231,6 +262,12 @@ python .\6_rewrite_engine\run.py `
   --script-mapping .\outputs\5_script_visual_binder\script_mapping.json `
   --output-dir .\outputs\6_rewrite_engine `
   --provider custom_openai
+```
+
+如果已经执行 5A，可把 `--script-mapping` 换成：
+
+```text
+.\outputs\5_audio_role_classifier\script_mapping_with_audio.json
 ```
 
 输出：
@@ -250,6 +287,12 @@ python .\7_timeline_composer\run.py `
   --output-dir .\outputs\7_timeline_composer
 ```
 
+如果已经执行 5A，第 7 步的 `--script-mapping` 也建议使用：
+
+```text
+.\outputs\5_audio_role_classifier\script_mapping_with_audio.json
+```
+
 输出：
 
 ```text
@@ -263,6 +306,8 @@ python .\main.py `
   --ref-video-path .\data\ref.mp4 `
   --movie-path .\data\movie.mp4 `
   --subtitle-srt .\data\ref.srt `
+  --enable-audio-role-classifier `
+  --movie-subtitle-srt .\data\movie.srt `
   --ai-provider custom_openai
 ```
 

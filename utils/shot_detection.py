@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[float, str], None]
 
-DEFAULT_KEYFRAME_POSITIONS = (0.12, 0.5, 0.88)
+DEFAULT_KEYFRAME_POSITIONS = (0.2, 0.4, 0.6, 0.8)
 
 
 def _shot_id(prefix: str, idx: int) -> str:
@@ -53,12 +53,8 @@ def _time_at_position(start: float, end: float, position: float) -> float:
     return start + duration * min(0.95, max(0.05, float(position)))
 
 
-def _keyframe_role(position: float) -> str:
-    if position <= 0.25:
-        return "start"
-    if position >= 0.75:
-        return "end"
-    return "middle"
+def _keyframe_role(index: int) -> str:
+    return f"fifth_{index + 1}"
 
 
 def _sample_times(start: float, end: float, sample_fps: float, max_frames: int) -> list[float]:
@@ -225,8 +221,8 @@ def detect_shots(
         sid = _shot_id(shot_prefix, idx)
         keyframes: list[str] = []
         keyframe_times: list[dict[str, Any]] = []
-        for position in positions:
-            role = _keyframe_role(position)
+        for keyframe_index, position in enumerate(positions):
+            role = _keyframe_role(keyframe_index)
             time_sec = _time_at_position(start, end, position)
             key_path = extract_frame(video_path, time_sec, key_dir / f"{sid}_{role}_{int(round(position * 100)):02d}.jpg")
             keyframes.append(str(key_path))

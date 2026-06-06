@@ -11,7 +11,9 @@ from clone_narration_video.utils.video_tools import extract_frame
 from clone_narration_video.utils.visual_features import (
     compare_homography_frames,
     compare_normalized_frames,
+    interior_sample_positions,
     load_normalized_frame,
+    select_keyframes,
 )
 
 
@@ -53,12 +55,18 @@ def _frame_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
     if not rows:
-        keyframes = [str(path) for path in item.get("keyframes") or [] if path]
+        keyframes = select_keyframes(item, max_frames=4)
         start = _float(item.get("start"))
         end = _float(item.get("end"), start)
-        for index, path in enumerate(keyframes):
-            position = 0.5 if len(keyframes) == 1 else index / max(1, len(keyframes) - 1)
-            rows.append({"path": path, "time": start + (end - start) * position, "source": "keyframe"})
+        duration = max(0.0, end - start)
+        for path, position in zip(keyframes, interior_sample_positions(len(keyframes))):
+            rows.append(
+                {
+                    "path": path,
+                    "time": start + duration * position,
+                    "source": "keyframe",
+                }
+            )
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in sorted(rows, key=lambda item: _float(item.get("time"))):
@@ -72,12 +80,11 @@ def _frame_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _time_grid(start: float, end: float, step: float, max_frames: int = 64) -> list[float]:
     if end <= start:
-        return [start]
+        return [start + (end - start) * 0.5]
     step = max(0.04, float(step))
     count = min(max_frames, max(1, int(round((end - start) / step)) + 1))
-    if count == 1:
-        return [(start + end) / 2.0]
-    return [start + (end - start) * (i / float(count - 1)) for i in range(count)]
+    duration = end - start
+    return [start + duration * position for position in interior_sample_positions(count)]
 
 
 def _limit_rows(rows: list[dict[str, Any]], max_rows: int) -> list[dict[str, Any]]:
@@ -258,7 +265,7 @@ def refine_candidates_for_ref(
     movie_video_path: str | Path | None = None,
     feature_cache_dir: str | Path | None = None,
     debug_dir: str | Path | None = None,
-    max_ref_frames: int = 5,
+    max_ref_frames: int = 4,
     max_movie_frames: int = 12,
 ) -> list[dict[str, Any]]:
     if alignment_mode == "classic" or not candidates:
