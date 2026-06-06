@@ -19,9 +19,10 @@ from clone_narration_video.utils.visual_features import build_shot_feature, comp
 
 from candidate_recall import build_candidates
 from diagnostics import build_timeline_item, write_low_confidence_report
-from path_solver import solve_global_path, solve_greedy_path
+from path_solver import solve_greedy_path, solve_segmented_global_path
+from refinement import refine_candidates_for_ref
 
-ALGORITHM_VERSION = "visual_alignment_v2"
+ALGORITHM_VERSION = "visual_alignment_v3"
 # 大写配置-输出分割后的镜头
 EXPORT_MATCHED_SHOT_CLIPS = True              # 默认不开启；开启后按 ref 镜头建子文件夹输出配对片段
 MATCHED_SHOT_CLIPS_DIRNAME = "matched_shot_clips"  # 独立文件夹；每个 ref 镜头一个子文件夹
@@ -82,6 +83,7 @@ def _manual_candidate(
         "visual_rank": None,
         "final_rank": 1,
         "detail": visual,
+        "refinement": {"enabled": False, "mode": "manual_override"},
         "diagnostics": {
             "transition_score": 1.0,
             "continuity_score": 1.0,
@@ -89,6 +91,12 @@ def _manual_candidate(
             "path_penalty": 0.0,
             "path_continuous": True,
             "boosted_by_continuity": False,
+            "path": {
+                "anchor": True,
+                "segment_index": None,
+                "jump_allowed": True,
+                "skip_state": False,
+            },
         },
     }
 
@@ -187,19 +195,39 @@ def align_visual_timeline(
     keyframes_per_shot: int = 3,
     recall_top_k: int = 80,
     rerank_top_k: int = 20,
+    refine_top_k: int = 3,
     feature_mode: str = "classic",
+    alignment_mode: str = "temporal",
+    temporal_radius_sec: float = 1.5,
+    temporal_step_sec: float = 1.0,
+    neighbor_shot_window: int = 1,
+    spatial_normalize: str = "auto",
+    device: str = "auto",
+    feature_cache_dir: str | Path | None = None,
+    save_debug_boards: bool = False,
     disable_global_path: bool = False,
     manual_overrides: dict[str, str] | None = None,
     diagnostics_dir: str | Path | None = None,
+    ref_video_path: str | Path | None = None,
+    movie_video_path: str | Path | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     if feature_mode not in {"classic", "classic_clip"}:
         raise ValueError(f"不支持的 feature_mode: {feature_mode}")
+    if alignment_mode not in {"classic", "temporal", "spatial_temporal", "topiq_temporal"}:
+        raise ValueError(f"Unsupported alignment_mode: {alignment_mode}")
+    if spatial_normalize not in {"auto", "off"}:
+        raise ValueError(f"Unsupported spatial_normalize: {spatial_normalize}")
 
     effective_feature_mode = "classic"
     embedding_status = "disabled"
     if feature_mode == "classic_clip":
         embedding_status = "not_configured_fallback_to_classic"
+    effective_alignment_mode = alignment_mode
+    alignment_status = "enabled"
+    if alignment_mode == "topiq_temporal":
+        effective_alignment_mode = "temporal"
+        alignment_status = "topiq_not_configured_fallback_to_temporal"
 
     movie_features: list[dict[str, Any]] = []
     total_movie = len(movie_shots)
@@ -220,15 +248,36 @@ def align_visual_timeline(
     for ref_index, ref in enumerate(ref_shots, start=1):
         ref_feature = build_shot_feature(ref, max_frames=keyframes_per_shot, feature_mode=effective_feature_mode)
         ref_features.append(ref_feature)
-        candidates_by_ref.append(
-            build_candidates(
-                ref_feature,
-                movie_features,
-                movie_shots,
-                recall_top_k=recall_top_k,
-                rerank_top_k=rerank_top_k,
-            )
+        candidates = build_candidates(
+            ref_feature,
+            movie_features,
+            movie_shots,
+            recall_top_k=recall_top_k,
+            rerank_top_k=rerank_top_k,
         )
+        if effective_alignment_mode != "classic":
+            if ref_index == 1 or ref_index == total_ref or ref_index % 5 == 0:
+                _progress(
+                    progress_callback,
+                    30.0 + (ref_index / max(1, total_ref)) * 55.0,
+                    f"Refining {effective_alignment_mode} candidates {ref_index}/{total_ref}",
+                )
+            candidates = refine_candidates_for_ref(
+                ref,
+                candidates,
+                movie_shots,
+                alignment_mode=effective_alignment_mode,
+                refine_top_k=refine_top_k,
+                temporal_radius_sec=temporal_radius_sec,
+                temporal_step_sec=temporal_step_sec,
+                neighbor_shot_window=neighbor_shot_window,
+                spatial_normalize=spatial_normalize,
+                ref_video_path=ref_video_path,
+                movie_video_path=movie_video_path,
+                feature_cache_dir=feature_cache_dir,
+                debug_dir=(Path(diagnostics_dir) / "debug_boards") if diagnostics_dir and save_debug_boards else None,
+            )
+        candidates_by_ref.append(candidates)
         if ref_index == 1 or ref_index == total_ref or ref_index % 10 == 0:
             _progress(
                 progress_callback,
@@ -241,8 +290,12 @@ def align_visual_timeline(
         chosen_path = solve_greedy_path(ref_shots, candidates_by_ref)
         match_type = "temporal_continuity"
     else:
-        chosen_path = solve_global_path(ref_shots, candidates_by_ref)
-        match_type = "global_path"
+        chosen_path = solve_segmented_global_path(ref_shots, candidates_by_ref, min_visual_score=min_score)
+        match_type = (
+            "segmented_global_path"
+            if effective_alignment_mode == "classic"
+            else f"{effective_alignment_mode}_segmented_global_path"
+        )
 
     movie_id_to_index = {_id(shot, "movie_shot_id"): idx for idx, shot in enumerate(movie_shots)}
     manual_overrides = manual_overrides or {}
@@ -291,8 +344,19 @@ def align_visual_timeline(
             "keyframes_per_shot": int(keyframes_per_shot),
             "recall_top_k": int(recall_top_k),
             "rerank_top_k": int(rerank_top_k),
+            "refine_top_k": int(refine_top_k),
             "output_top_n": int(top_n),
             "min_score": float(min_score),
+            "alignment_mode": effective_alignment_mode,
+            "requested_alignment_mode": alignment_mode,
+            "alignment_status": alignment_status,
+            "temporal_radius_sec": float(temporal_radius_sec),
+            "temporal_step_sec": float(temporal_step_sec),
+            "neighbor_shot_window": int(neighbor_shot_window),
+            "spatial_normalize": spatial_normalize,
+            "device": device,
+            "feature_cache_dir": str(feature_cache_dir) if feature_cache_dir else None,
+            "debug_boards_enabled": bool(save_debug_boards),
             "global_path_enabled": not disable_global_path,
             "manual_override_count": len(manual_overrides),
             "summary": _summary(timeline),
@@ -310,7 +374,16 @@ def main() -> None:
     parser.add_argument("--keyframes-per-shot", type=int, default=3)
     parser.add_argument("--recall-top-k", type=int, default=80)
     parser.add_argument("--rerank-top-k", type=int, default=20)
+    parser.add_argument("--refine-top-k", type=int, default=3)
     parser.add_argument("--feature-mode", choices=["classic", "classic_clip"], default="classic")
+    parser.add_argument("--alignment-mode", choices=["classic", "temporal", "spatial_temporal", "topiq_temporal"], default="temporal")
+    parser.add_argument("--temporal-radius-sec", type=float, default=1.5)
+    parser.add_argument("--temporal-step-sec", type=float, default=1.0)
+    parser.add_argument("--neighbor-shot-window", type=int, default=1)
+    parser.add_argument("--spatial-normalize", choices=["auto", "off"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--feature-cache-dir")
+    parser.add_argument("--save-debug-boards", action="store_true")
     parser.add_argument("--disable-global-path", action="store_true")
     parser.add_argument("--manual-overrides", help="人工覆写 JSON")
     parser.add_argument("--diagnostics-dir", help="诊断输出目录；默认写到 output-dir/diagnostics")
@@ -320,6 +393,7 @@ def main() -> None:
     movie_data = read_json(args.movie_shots)
     output_dir = Path(args.output_dir)
     diagnostics_dir = Path(args.diagnostics_dir) if args.diagnostics_dir else output_dir / "diagnostics"
+    feature_cache_dir = Path(args.feature_cache_dir) if args.feature_cache_dir else output_dir / "cache"
     result = align_visual_timeline(
         ref_data.get("ref_shots") or [],
         movie_data.get("movie_shots") or [],
@@ -328,10 +402,21 @@ def main() -> None:
         keyframes_per_shot=args.keyframes_per_shot,
         recall_top_k=args.recall_top_k,
         rerank_top_k=args.rerank_top_k,
+        refine_top_k=args.refine_top_k,
         feature_mode=args.feature_mode,
+        alignment_mode=args.alignment_mode,
+        temporal_radius_sec=args.temporal_radius_sec,
+        temporal_step_sec=args.temporal_step_sec,
+        neighbor_shot_window=args.neighbor_shot_window,
+        spatial_normalize=args.spatial_normalize,
+        device=args.device,
+        feature_cache_dir=feature_cache_dir,
+        save_debug_boards=args.save_debug_boards,
         disable_global_path=args.disable_global_path,
         manual_overrides=_load_manual_overrides(args.manual_overrides),
         diagnostics_dir=diagnostics_dir,
+        ref_video_path=ref_data.get("ref_video_path"),
+        movie_video_path=movie_data.get("movie_path"),
         progress_callback=lambda percent, message: emit_progress("alignment", percent, message),
     )
     out = write_json(output_dir / "ref_to_movie_timeline.json", result)

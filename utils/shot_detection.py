@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[float, str], None]
 
+DEFAULT_KEYFRAME_POSITIONS = (0.12, 0.5, 0.88)
+
 
 def _shot_id(prefix: str, idx: int) -> str:
     width = 6 if prefix == "movie_shot" else 3
@@ -32,6 +34,47 @@ def _normalize_scenes(scenes: np.ndarray, frame_count: int, min_frames: int) -> 
         elif e_i - s_i + 1 >= min_frames or not out:
             out.append((s_i, e_i))
     return out or [(0, max(0, frame_count - 1))]
+
+
+def parse_keyframe_positions(value: str | list[float] | tuple[float, ...] | None) -> list[float]:
+    if value is None:
+        return list(DEFAULT_KEYFRAME_POSITIONS)
+    if isinstance(value, str):
+        raw = [part.strip() for part in value.split(",")]
+        positions = [float(part) for part in raw if part]
+    else:
+        positions = [float(part) for part in value]
+    cleaned = sorted({min(0.95, max(0.05, item)) for item in positions})
+    return cleaned or list(DEFAULT_KEYFRAME_POSITIONS)
+
+
+def _time_at_position(start: float, end: float, position: float) -> float:
+    duration = max(1e-6, end - start)
+    return start + duration * min(0.95, max(0.05, float(position)))
+
+
+def _keyframe_role(position: float) -> str:
+    if position <= 0.25:
+        return "start"
+    if position >= 0.75:
+        return "end"
+    return "middle"
+
+
+def _sample_times(start: float, end: float, sample_fps: float, max_frames: int) -> list[float]:
+    if sample_fps <= 0 or max_frames <= 0:
+        return []
+    duration = max(0.0, end - start)
+    if duration <= 0:
+        return []
+    count = min(max_frames, max(1, int(round(duration * sample_fps))))
+    if count == 1:
+        return [(start + end) / 2.0]
+    margin = min(duration * 0.08, 0.25)
+    usable_start = start + margin
+    usable_end = max(usable_start, end - margin)
+    step = (usable_end - usable_start) / float(count - 1)
+    return [usable_start + step * i for i in range(count)]
 
 
 def _detect_with_transnet(
@@ -145,6 +188,9 @@ def detect_shots(
     keyframe_dir: str | Path,
     threshold: float = 0.5,
     backend: str = "auto",
+    keyframe_positions: str | list[float] | tuple[float, ...] | None = None,
+    sample_fps: float = 0.0,
+    max_sample_frames_per_shot: int = 0,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     info = video_info(video_path)
@@ -161,6 +207,12 @@ def detect_shots(
 
     key_dir = Path(keyframe_dir)
     key_dir.mkdir(parents=True, exist_ok=True)
+    sample_dir = key_dir / "samples"
+    positions = parse_keyframe_positions(keyframe_positions)
+    sample_fps = max(0.0, float(sample_fps))
+    max_sample_frames_per_shot = max(0, int(max_sample_frames_per_shot))
+    if sample_fps > 0 and max_sample_frames_per_shot > 0:
+        sample_dir.mkdir(parents=True, exist_ok=True)
     shots = []
     total_scenes = len(scenes)
     if progress_callback:
@@ -170,16 +222,44 @@ def detect_shots(
         end = min(duration or ((end_f + 1) / fps), (end_f + 1) / fps)
         if end <= start:
             end = start + (1.0 / fps)
-        mid = (start + end) / 2.0
         sid = _shot_id(shot_prefix, idx)
-        key_path = extract_frame(video_path, mid, key_dir / f"{sid}_mid.jpg")
+        keyframes: list[str] = []
+        keyframe_times: list[dict[str, Any]] = []
+        for position in positions:
+            role = _keyframe_role(position)
+            time_sec = _time_at_position(start, end, position)
+            key_path = extract_frame(video_path, time_sec, key_dir / f"{sid}_{role}_{int(round(position * 100)):02d}.jpg")
+            keyframes.append(str(key_path))
+            keyframe_times.append(
+                {
+                    "path": str(key_path),
+                    "time": round(time_sec, 3),
+                    "frame": int(round(time_sec * fps)),
+                    "role": role,
+                    "position": round(position, 4),
+                }
+            )
+
+        sample_frames: list[dict[str, Any]] = []
+        if sample_fps > 0 and max_sample_frames_per_shot > 0:
+            for sample_idx, time_sec in enumerate(_sample_times(start, end, sample_fps, max_sample_frames_per_shot), start=1):
+                sample_path = extract_frame(video_path, time_sec, sample_dir / f"{sid}_sample_{sample_idx:03d}.jpg")
+                sample_frames.append(
+                    {
+                        "path": str(sample_path),
+                        "time": round(time_sec, 3),
+                        "frame": int(round(time_sec * fps)),
+                    }
+                )
         shots.append(
             {
                 f"{shot_prefix}_id": sid,
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "duration": round(end - start, 3),
-                "keyframes": [str(key_path)],
+                "keyframes": keyframes,
+                "keyframe_times": keyframe_times,
+                "sample_frames": sample_frames,
                 "start_frame": int(start_f),
                 "end_frame": int(end_f),
             }

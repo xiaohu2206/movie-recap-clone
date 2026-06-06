@@ -39,10 +39,13 @@ def transition_metrics(
         backward_penalty = min(0.65, (float(prev.get("movie_start") or 0.0) - current_start) / 25.0)
 
     jump_penalty = 0.0
-    if abs_delta > 20.0:
-        jump_penalty = min(0.28, (abs_delta - 20.0) / 100.0)
+    jump_threshold = 60.0 if bool(prev.get("path_anchor")) or bool(current.get("path_anchor")) else 20.0
+    if abs_delta > jump_threshold:
+        jump_penalty = min(0.28, (abs_delta - jump_threshold) / 100.0)
         if float(current.get("visual_score") or 0.0) >= 0.82:
             jump_penalty *= 0.35
+        if bool(prev.get("path_anchor")) or bool(current.get("path_anchor")):
+            jump_penalty *= 0.15
 
     repeat_penalty = 0.0
     if str(prev.get("movie_shot_id") or "") and str(prev.get("movie_shot_id")) == str(current.get("movie_shot_id")):
@@ -58,7 +61,7 @@ def transition_metrics(
         "backward_penalty": round(float(backward_penalty), 4),
         "jump_penalty": round(float(jump_penalty), 4),
         "repeat_penalty": round(float(repeat_penalty), 4),
-        "path_continuous": backward_penalty == 0.0 and abs_delta <= 12.0,
+        "path_continuous": backward_penalty == 0.0 and abs_delta <= (30.0 if bool(prev.get("path_anchor")) or bool(current.get("path_anchor")) else 12.0),
         "boosted_by_continuity": continuity_score >= float(current.get("visual_score") or 0.0) + 0.08,
     }
 
@@ -174,6 +177,89 @@ def solve_global_path(
         candidate["diagnostics"] = state.get("metrics") or {}
         candidate["final_rank"] = int(state.get("final_rank") or 1)
         chosen.append(candidate)
+    return chosen
+
+
+def _score_gap(candidates: list[dict[str, Any]]) -> float:
+    if not candidates:
+        return 0.0
+    ordered = sorted(candidates, key=lambda row: float(row.get("visual_score") or 0.0), reverse=True)
+    if len(ordered) == 1:
+        return float(ordered[0].get("visual_score") or 0.0)
+    return float(ordered[0].get("visual_score") or 0.0) - float(ordered[1].get("visual_score") or 0.0)
+
+
+def _is_anchor(candidate: dict[str, Any], candidates: list[dict[str, Any]]) -> bool:
+    return (
+        float(candidate.get("visual_score") or 0.0) >= 0.86
+        and _score_gap(candidates) >= 0.10
+        and float(candidate.get("refinement_score") or candidate.get("visual_score") or 0.0) >= 0.78
+    )
+
+
+def solve_segmented_global_path(
+    ref_shots: list[dict[str, Any]],
+    candidates_by_ref: list[list[dict[str, Any]]],
+    *,
+    min_visual_score: float = 0.35,
+) -> list[dict[str, Any] | None]:
+    working: list[list[dict[str, Any]]] = []
+    segment_index = 0
+    for ref_index, candidates in enumerate(candidates_by_ref):
+        if not candidates:
+            working.append([])
+            continue
+        ordered = sorted(candidates, key=lambda row: float(row.get("visual_score") or 0.0), reverse=True)
+        best = dict(ordered[0])
+        if _is_anchor(best, ordered):
+            best["path_anchor"] = True
+            best_diag = dict(best.get("diagnostics") or {})
+            best_diag["path"] = {
+                "anchor": True,
+                "segment_index": segment_index,
+                "jump_allowed": True,
+                "skip_state": False,
+            }
+            best["diagnostics"] = best_diag
+            working.append([best])
+            segment_index += 1
+            continue
+        if float(best.get("visual_score") or 0.0) < float(min_visual_score) * 0.85:
+            working.append([])
+            continue
+        working.append(ordered)
+
+    chosen: list[dict[str, Any] | None] = [None] * len(working)
+    cursor = 0
+    while cursor < len(working):
+        if not working[cursor]:
+            cursor += 1
+            continue
+        start = cursor
+        while cursor < len(working) and working[cursor]:
+            cursor += 1
+        segment_path = solve_global_path(ref_shots[start:cursor], working[start:cursor])
+        for offset, candidate in enumerate(segment_path):
+            chosen[start + offset] = candidate
+    current_segment = 0
+    for index, candidate in enumerate(chosen):
+        if candidate is None:
+            continue
+        diagnostics = dict(candidate.get("diagnostics") or {})
+        path_diag = dict(diagnostics.get("path") or {})
+        anchor = bool(candidate.get("path_anchor") or path_diag.get("anchor"))
+        if anchor and index > 0:
+            current_segment += 1
+        path_diag.update(
+            {
+                "anchor": anchor,
+                "segment_index": current_segment,
+                "jump_allowed": anchor,
+                "skip_state": False,
+            }
+        )
+        diagnostics["path"] = path_diag
+        candidate["diagnostics"] = diagnostics
     return chosen
 
 

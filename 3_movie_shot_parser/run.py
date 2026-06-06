@@ -29,6 +29,9 @@ def parse_movie_shots(
     output_dir: str | Path,
     threshold: float = 0.5,
     backend: str = "auto",
+    keyframe_positions: str | list[float] | None = None,
+    sample_fps: float = 0.0,
+    max_sample_frames_per_shot: int = 0,
     movie_id: str | None = None,
 ) -> dict[str, Any]:
     video = Path(movie_path)
@@ -44,6 +47,9 @@ def parse_movie_shots(
         keyframe_dir=out_dir / "keyframes",
         threshold=threshold,
         backend=backend,
+        keyframe_positions=keyframe_positions,
+        sample_fps=sample_fps,
+        max_sample_frames_per_shot=max_sample_frames_per_shot,
         progress_callback=lambda percent, message: emit_progress("shots", percent, message),
     )
     emit_progress("shots", 100, "Movie shot detection complete")
@@ -78,6 +84,9 @@ def main() -> None:
     parser.add_argument("--output-dir", default=str(default_output_dir("3_movie_shot_parser")))
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--backend", choices=["auto", "transnet", "opencv"], default="auto")
+    parser.add_argument("--keyframe-positions", default="0.12,0.5,0.88")
+    parser.add_argument("--sample-fps", type=float, default=0.0)
+    parser.add_argument("--max-sample-frames-per-shot", type=int, default=0)
     args = parser.parse_args()
 
     data = read_json(args.input) if args.input else {}
@@ -89,6 +98,9 @@ def main() -> None:
         output_dir=args.output_dir,
         threshold=args.threshold,
         backend=args.backend,
+        keyframe_positions=args.keyframe_positions,
+        sample_fps=args.sample_fps,
+        max_sample_frames_per_shot=args.max_sample_frames_per_shot,
         movie_id=data.get("movie_id"),
     )
     print(write_json(Path(args.output_dir) / "movie_shots.json", result))

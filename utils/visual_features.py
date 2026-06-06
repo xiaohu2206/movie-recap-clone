@@ -16,6 +16,183 @@ def _read_image(path: str | Path) -> np.ndarray | None:
     return img
 
 
+def _clip01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def crop_black_borders(img: np.ndarray, *, threshold: int = 10, min_content_ratio: float = 0.35) -> np.ndarray:
+    if img.size == 0:
+        return img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mask = gray > threshold
+    coords = cv2.findNonZero(mask.astype("uint8"))
+    if coords is None:
+        return img
+    x, y, w, h = cv2.boundingRect(coords)
+    if w * h < img.shape[0] * img.shape[1] * min_content_ratio:
+        return img
+    return img[y : y + h, x : x + w]
+
+
+def normalize_frame_image(
+    img: np.ndarray,
+    *,
+    target_width: int = 854,
+    crop_borders: bool = True,
+    equalize_luma: bool = True,
+) -> np.ndarray:
+    if crop_borders:
+        img = crop_black_borders(img)
+    h, w = img.shape[:2]
+    if w <= 0 or h <= 0:
+        return img
+    if w > target_width:
+        scale = target_width / float(w)
+        img = cv2.resize(img, (target_width, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+    if equalize_luma:
+        yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
+        yuv[:, :, 0] = cv2.equalizeHist(yuv[:, :, 0])
+        img = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+    return img
+
+
+def load_normalized_frame(
+    path: str | Path,
+    *,
+    spatial_normalize: str = "auto",
+    target_width: int = 854,
+) -> np.ndarray | None:
+    img = _read_image(path)
+    if img is None:
+        return None
+    return normalize_frame_image(
+        img,
+        target_width=target_width,
+        crop_borders=spatial_normalize != "off",
+        equalize_luma=spatial_normalize != "off",
+    )
+
+
+def _resize_pair(a: np.ndarray, b: np.ndarray, width: int = 320) -> tuple[np.ndarray, np.ndarray]:
+    def resize(img: np.ndarray) -> np.ndarray:
+        h, w = img.shape[:2]
+        if w <= 0 or h <= 0:
+            return img
+        scale = width / float(w)
+        return cv2.resize(img, (width, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+
+    a2 = resize(a)
+    b2 = resize(b)
+    height = min(a2.shape[0], b2.shape[0])
+    if height <= 0:
+        return a2, b2
+    return a2[:height, :width], b2[:height, :width]
+
+
+def _weighted_mean(diff: np.ndarray, *, subtitle_mask_ratio: float = 0.18) -> float:
+    if subtitle_mask_ratio <= 0:
+        return float(np.mean(diff))
+    weights = np.ones(diff.shape[:2], dtype=np.float32)
+    masked_rows = int(round(weights.shape[0] * min(0.45, max(0.0, subtitle_mask_ratio))))
+    if masked_rows > 0:
+        weights[-masked_rows:, :] = 0.35
+    return float(np.sum(diff.astype("float32") * weights) / max(1e-6, float(np.sum(weights))))
+
+
+def compare_normalized_frames(
+    ref_img: np.ndarray,
+    movie_img: np.ndarray,
+    *,
+    subtitle_mask_ratio: float = 0.18,
+) -> dict[str, float]:
+    ref, movie = _resize_pair(ref_img, movie_img)
+    if ref.size == 0 or movie.size == 0:
+        return {"score": 0.0, "gray": 0.0, "edge": 0.0, "hist": 0.0, "ssim": 0.0}
+
+    ref_gray = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
+    movie_gray = cv2.cvtColor(movie, cv2.COLOR_BGR2GRAY)
+    gray_diff = _weighted_mean(cv2.absdiff(ref_gray, movie_gray), subtitle_mask_ratio=subtitle_mask_ratio) / 255.0
+    gray_score = 1.0 - gray_diff
+
+    ref_edge = cv2.Canny(ref_gray, 80, 160)
+    movie_edge = cv2.Canny(movie_gray, 80, 160)
+    edge_diff = _weighted_mean(cv2.absdiff(ref_edge, movie_edge), subtitle_mask_ratio=subtitle_mask_ratio) / 255.0
+    edge_score = 1.0 - edge_diff
+
+    ref_hist = _hist(ref)
+    movie_hist = _hist(movie)
+    hist_score = float(cv2.compareHist(ref_hist.astype("float32"), movie_hist.astype("float32"), cv2.HISTCMP_CORREL))
+    hist_score = _clip01((hist_score + 1.0) / 2.0)
+
+    ref_f = ref_gray.astype("float32")
+    movie_f = movie_gray.astype("float32")
+    mu_ref = float(np.mean(ref_f))
+    mu_movie = float(np.mean(movie_f))
+    var_ref = float(np.var(ref_f))
+    var_movie = float(np.var(movie_f))
+    cov = float(np.mean((ref_f - mu_ref) * (movie_f - mu_movie)))
+    c1 = 6.5025
+    c2 = 58.5225
+    ssim = ((2 * mu_ref * mu_movie + c1) * (2 * cov + c2)) / ((mu_ref**2 + mu_movie**2 + c1) * (var_ref + var_movie + c2))
+    ssim_score = _clip01(ssim)
+
+    score = gray_score * 0.34 + edge_score * 0.26 + hist_score * 0.18 + ssim_score * 0.22
+    return {
+        "score": round(_clip01(score), 4),
+        "gray": round(_clip01(gray_score), 4),
+        "edge": round(_clip01(edge_score), 4),
+        "hist": round(_clip01(hist_score), 4),
+        "ssim": round(_clip01(ssim_score), 4),
+    }
+
+
+def compare_homography_frames(
+    ref_img: np.ndarray,
+    movie_img: np.ndarray,
+    *,
+    subtitle_mask_ratio: float = 0.18,
+) -> dict[str, Any]:
+    ref, movie = _resize_pair(ref_img, movie_img)
+    if ref.size == 0 or movie.size == 0:
+        return {"score": 0.0, "transform": "failed", "inliers": 0, "detail": {}}
+
+    ref_gray = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
+    movie_gray = cv2.cvtColor(movie, cv2.COLOR_BGR2GRAY)
+    detector = cv2.SIFT_create(nfeatures=800) if hasattr(cv2, "SIFT_create") else cv2.ORB_create(nfeatures=900)
+    kp_movie, desc_movie = detector.detectAndCompute(movie_gray, None)
+    kp_ref, desc_ref = detector.detectAndCompute(ref_gray, None)
+    if desc_movie is None or desc_ref is None or len(kp_movie) < 12 or len(kp_ref) < 12:
+        detail = compare_normalized_frames(ref, movie, subtitle_mask_ratio=subtitle_mask_ratio)
+        return {"score": detail["score"], "transform": "failed", "inliers": 0, "detail": detail}
+
+    if desc_movie.dtype == np.float32:
+        matcher = cv2.BFMatcher(cv2.NORM_L2)
+    else:
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    matches = matcher.knnMatch(desc_movie, desc_ref, k=2)
+    good = []
+    for pair in matches:
+        if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance:
+            good.append(pair[0])
+    if len(good) < 10:
+        detail = compare_normalized_frames(ref, movie, subtitle_mask_ratio=subtitle_mask_ratio)
+        return {"score": detail["score"], "transform": "failed", "inliers": len(good), "detail": detail}
+
+    src_pts = np.float32([kp_movie[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    matrix, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    if matrix is None or inlier_mask is None:
+        detail = compare_normalized_frames(ref, movie, subtitle_mask_ratio=subtitle_mask_ratio)
+        return {"score": detail["score"], "transform": "failed", "inliers": 0, "detail": detail}
+
+    warped = cv2.warpPerspective(movie, matrix, (ref.shape[1], ref.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    detail = compare_normalized_frames(ref, warped, subtitle_mask_ratio=subtitle_mask_ratio)
+    inliers = int(inlier_mask.sum())
+    inlier_ratio = inliers / max(1, len(good))
+    score = _clip01(float(detail["score"]) * 0.85 + min(1.0, inlier_ratio) * 0.15)
+    return {"score": round(score, 4), "transform": "homography", "inliers": inliers, "detail": detail}
+
+
 def _dhash(gray: np.ndarray, size: int = 8) -> int:
     small = cv2.resize(gray, (size + 1, size), interpolation=cv2.INTER_AREA)
     diff = small[:, 1:] > small[:, :-1]

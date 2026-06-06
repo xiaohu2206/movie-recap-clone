@@ -32,6 +32,9 @@ def analyze_reference_video(
     asr_provider: str = "bcut",
     threshold: float = 0.5,
     backend: str = "auto",
+    keyframe_positions: str | list[float] | None = None,
+    sample_fps: float = 0.0,
+    max_sample_frames_per_shot: int = 0,
     ref_video_id: str | None = None,
 ) -> dict[str, Any]:
     video = Path(ref_video_path)
@@ -58,6 +61,9 @@ def analyze_reference_video(
         keyframe_dir=out_dir / "keyframes",
         threshold=threshold,
         backend=backend,
+        keyframe_positions=keyframe_positions,
+        sample_fps=sample_fps,
+        max_sample_frames_per_shot=max_sample_frames_per_shot,
         progress_callback=lambda percent, message: emit_progress("reference", 10.0 + percent * 0.9, message),
     )
     emit_progress("reference", 100, "Reference analysis complete")
@@ -104,6 +110,9 @@ def main() -> None:
     parser.add_argument("--asr-provider", choices=["bcut", "none"], default="bcut")
     parser.add_argument("--threshold", type=float, default=0.5, help="TransNetV2 镜头切分阈值")
     parser.add_argument("--backend", choices=["auto", "transnet", "opencv"], default="auto")
+    parser.add_argument("--keyframe-positions", default="0.12,0.5,0.88")
+    parser.add_argument("--sample-fps", type=float, default=0.0)
+    parser.add_argument("--max-sample-frames-per-shot", type=int, default=0)
     args = parser.parse_args()
 
     data = _load_input(args)
@@ -118,6 +127,9 @@ def main() -> None:
         asr_provider=args.asr_provider,
         threshold=args.threshold,
         backend=args.backend,
+        keyframe_positions=args.keyframe_positions,
+        sample_fps=args.sample_fps,
+        max_sample_frames_per_shot=args.max_sample_frames_per_shot,
         ref_video_id=data.get("ref_video_id"),
     )
     print(write_json(Path(args.output_dir) / "ref_analysis.json", result))

@@ -89,9 +89,12 @@ def format_candidates(
                 "visual_score": round(float(candidate.get("visual_score") or 0.0), 4),
                 "recall_score": round(float(candidate.get("recall_score") or 0.0), 4),
                 "final_score": round(float(candidate.get("final_score") or 0.0), 4),
+                "coarse_visual_score": round(float(candidate.get("coarse_visual_score") or candidate.get("visual_score") or 0.0), 4),
+                "refinement_score": round(float(candidate.get("refinement_score") or 0.0), 4),
                 "visual_rank": int(candidate.get("visual_rank") or index),
                 "final_rank": candidate.get("final_rank"),
                 "selected": str(candidate.get("movie_shot_id") or "") == str(selected_movie_shot_id or ""),
+                "refinement": candidate.get("refinement") or {},
                 "detail": {
                     "score": detail.get("score", 0.0),
                     "hash": detail.get("hash", 0.0),
@@ -133,6 +136,13 @@ def build_timeline_item(
         manual_override=manual_override,
     )
     selected_id = str((candidate or {}).get("movie_shot_id") or "")
+    refinement_info = (candidate or {}).get("refinement") or {"enabled": False}
+    path_diag = path_info.get("path") or {
+        "anchor": False,
+        "segment_index": None,
+        "jump_allowed": False,
+        "skip_state": candidate is None,
+    }
     return {
         "ref_shot_id": str(ref.get("ref_shot_id") or ref.get("shot_id") or ""),
         "ref_start": float(ref.get("start") or 0.0),
@@ -156,6 +166,8 @@ def build_timeline_item(
             "path_continuous": bool(path_info.get("path_continuous", False)),
             "boosted_by_continuity": bool(path_info.get("boosted_by_continuity", False)),
             "accepted_reason": reason,
+            "refinement": refinement_info,
+            "path": path_diag,
         },
         "candidates": format_candidates(candidates, top_n=top_n, selected_movie_shot_id=selected_id),
     }
