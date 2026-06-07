@@ -1,15 +1,16 @@
 # clone_narration_video
 
-这是独立的影视解说克隆子项目。当前已实现八个模块：
+这是独立的影视解说克隆子项目。当前已实现八个主模块，并支持可选的 5A 原声片段识别：
 
 1. `1_reference_analyzer` 参考视频解析
 2. `2_narration_segmenter` 解说段落切分
 3. `3_movie_shot_parser` 原电影镜头拆分
 4. `4_visual_alignment_engine` 画面定位
 5. `5_script_visual_binder` 解说画面绑定
-6. `6_rewrite_engine` 仿稿
-7. `7_timeline_composer` 生成新视频脚本时间轴
-8. `8_generate_video` 生成剪映草稿 / 直接生成视频
+6. `5_audio_role_classifier` 可选：识别哪些片段应保留原片原声
+7. `6_rewrite_engine` 仿稿
+8. `7_timeline_composer` 生成新视频脚本时间轴
+9. `8_generate_video` 生成剪映草稿 / 直接生成视频
 
 ## 环境
 
@@ -79,6 +80,8 @@ python .\main.py `
   --ref-video-path .\data\ref.mp4 `
   --movie-path .\data\movie.mp4 `
   --subtitle-srt .\data\ref.srt `
+  --enable-audio-role-classifier `
+  --movie-subtitle-srt .\data\movie.srt `
   --ai-provider custom_openai `
   --render-mode both
 ```
@@ -122,8 +125,10 @@ frontend\release\win-unpacked\Clone Narration Studio.exe
 ```powershell
 python .\main.py --only-step 5 --output-root .\outputs
 python .\main.py --only-step audio --output-root .\outputs --movie-subtitle-srt .\data\movie.srt
-python .\main.py --only-step 6 --output-root .\outputs --ai-provider custom_openai
+python .\main.py --only-step 6 --output-root .\outputs --enable-audio-role-classifier --ai-provider custom_openai
 ```
+
+如果已经启用过 5A，后续单独重跑第 6、7、8 步时也要继续带上增强后的 mapping。否则第 6 步会读取普通 `script_mapping.json`，第 7 步只能得到默认的 `audio_mode=voiceover`。
 
 `--only-step` 支持 `1` 到 `8`，以及原声片段识别的 `audio` / `5a`。
 
@@ -234,6 +239,15 @@ outputs\5_script_visual_binder\script_mapping.json
 
 ### 5A. 原声片段识别
 
+该步骤会在 `script_mapping.json` 基础上补充原声决策字段，包括：
+
+```text
+movie_time_ranges[*].audio_role
+movie_time_ranges[*].audio_action
+movie_time_ranges[*].audio_confidence
+movie_time_ranges[*].audio_reason
+text_units[*].role / action / related_range_ids
+```
 
 没有原电影字幕时，可传 `--movie-path` 自动识别。该模式只会裁剪并识别 `script_mapping.json` 中已匹配到的电影镜头时间段，不会识别整部电影：
 
@@ -253,22 +267,26 @@ python .\5_audio_role_classifier\run.py `
 outputs\5_audio_role_classifier\script_mapping_with_audio.json
 ```
 
+启用 5A 后，后续第 6、7 步都应继续使用这个增强后的 `script_mapping_with_audio.json`，否则原声标记会在后续产物中丢失。
+
 ### 6. 仿稿
 
 使用 AI：
 
 ```powershell
 python .\6_rewrite_engine\run.py `
-  --script-mapping .\outputs\5_script_visual_binder\script_mapping.json `
+  --script-mapping .\outputs\5_audio_role_classifier\script_mapping_with_audio.json `
   --output-dir .\outputs\6_rewrite_engine `
   --provider custom_openai
 ```
 
-如果已经执行 5A，可把 `--script-mapping` 换成：
+如果没有启用 5A，才使用普通 mapping：
 
 ```text
-.\outputs\5_audio_role_classifier\script_mapping_with_audio.json
+.\outputs\5_script_visual_binder\script_mapping.json
 ```
+
+使用增强后的 mapping 时，仿稿会读取 `text_units`：只处理 `role=narration` 的单元，`original_dialogue` 单元会在 `rewritten_units` 中保留为空文案并标记 `keep_original_audio=true`。
 
 输出：
 
@@ -281,17 +299,21 @@ outputs\6_rewrite_engine\rewritten_script.json
 ```powershell
 python .\7_timeline_composer\run.py `
   --rewritten-script .\outputs\6_rewrite_engine\rewritten_script.json `
-  --script-mapping .\outputs\5_script_visual_binder\script_mapping.json `
+  --script-mapping .\outputs\5_audio_role_classifier\script_mapping_with_audio.json `
   --movie-shots .\outputs\3_movie_shot_parser\movie_shots.json `
   --movie-source .\data\movie.mp4 `
   --output-dir .\outputs\7_timeline_composer
 ```
 
-如果已经执行 5A，第 7 步的 `--script-mapping` 也建议使用：
+如果没有启用 5A，才使用普通 mapping：
 
 ```text
-.\outputs\5_audio_role_classifier\script_mapping_with_audio.json
+.\outputs\5_script_visual_binder\script_mapping.json
 ```
+
+当 `rewritten_script.json` 包含 `rewritten_units` 时，第 7 步会把 mixed segment 拆成多个 timeline item，并写入 `audio_mode`、`OST`、`audio_decision`。其中 `audio_mode=original` 的 item 时长直接取原片 clip 时长，不按字数估算 TTS。
+
+排查提示：如果 `final_timeline.json` 里全部都是 `"audio_mode": "voiceover"`，优先检查第 6 步是否使用了 `script_mapping_with_audio.json`。第 5A 输出中应能看到 `audio_action=play_original_audio`，第 6 步输出中应保留 `rewritten_units` 或带音频字段的 `movie_time_ranges`。
 
 输出：
 
@@ -299,7 +321,7 @@ python .\7_timeline_composer\run.py `
 outputs\7_timeline_composer\final_timeline.json
 ```
 
-## 七模块流水线 / 可选第 8 步渲染
+## 完整流水线 / 可选第 8 步渲染
 
 ```powershell
 python .\main.py `
@@ -314,6 +336,15 @@ python .\main.py `
 最终输出位于 `outputs\7_timeline_composer\final_timeline.json`。
 
 ## 第 8 步：生成剪映草稿 / 直接生成视频
+
+第 8 步会读取 `final_timeline.json` 中的 `audio_mode`：
+
+```text
+audio_mode=voiceover => 裁视频时去掉原片声音，合成 TTS 后 mux 到视频
+audio_mode=original  => 不生成 TTS，不生成静音音频，裁视频时保留原片音轨
+```
+
+生成剪映草稿时，`voiceover` 片段的视频轨音量为 0，并额外添加 TTS 音频轨；`original` 片段的视频轨音量为 1，不额外添加配音轨。
 
 同时生成剪映草稿和 mp4：
 ```powershell
@@ -347,9 +378,23 @@ python .\8_generate_video\run.py `
 输出：
 ```text
 outputs\8_generate_video\audio\
-outputs\8_generate_video\jianying_drafts\
 outputs\8_generate_video\clone_narration_output.mp4
 outputs\8_generate_video\generate_video_result.json
+```
+
+剪映草稿默认写入本机剪映/CapCut 草稿目录；也可以通过 `--jianying-draft-dir` 指定草稿根目录。
+
+`generate_video_result.json` 中的 `audio_results` 会标记原声片段：
+
+```json
+{
+  "item_003": {
+    "path": "",
+    "duration": 3.215,
+    "original_audio": true,
+    "silent": false
+  }
+}
 ```
 
 完整流水线最后也可以追加渲染：
@@ -358,6 +403,8 @@ python .\main.py `
   --ref-video-path .\data\ref.mp4 `
   --movie-path .\data\movie.mp4 `
   --subtitle-srt .\data\ref.srt `
+  --enable-audio-role-classifier `
+  --movie-subtitle-srt .\data\movie.srt `
   --ai-provider custom_openai `
   --render-mode both `
   --edge-voice-id zh-CN-XiaoxiaoNeural `

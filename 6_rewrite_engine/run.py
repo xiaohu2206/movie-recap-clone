@@ -52,37 +52,133 @@ def _char_len(text: str) -> int:
     return len(re.sub(r"\s+", "", text or ""))
 
 
+def _text_units(item: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = item.get("text_units") or []
+    return rows if isinstance(rows, list) else []
+
+
+def _unit_id(unit: dict[str, Any], index: int) -> str:
+    return str(unit.get("unit_id") or f"unit_{index:03d}")
+
+
+def _unit_text(unit: dict[str, Any]) -> str:
+    return str(unit.get("text") or unit.get("old_text") or "")
+
+
+def _is_narration_unit(unit: dict[str, Any]) -> bool:
+    role = str(unit.get("role") or "narration")
+    action = str(unit.get("action") or "rewrite")
+    return role == "narration" and action not in {"play_original_audio", "manual_review"}
+
+
+def _is_original_audio_unit(unit: dict[str, Any]) -> bool:
+    role = str(unit.get("role") or "")
+    action = str(unit.get("action") or "")
+    return role == "original_dialogue" or action == "play_original_audio"
+
+
+def _join_text(parts: list[str]) -> str:
+    return "".join(x.strip() for x in parts if x and x.strip())
+
+
+def _build_rewritten_units(
+    item: dict[str, Any],
+    *,
+    unit_rewrites: dict[str, str],
+    passthrough_narration: bool,
+) -> list[dict[str, Any]]:
+    rewritten_units: list[dict[str, Any]] = []
+    for idx, unit in enumerate(_text_units(item), start=1):
+        uid = _unit_id(unit, idx)
+        old_text = _unit_text(unit)
+        keep_original = _is_original_audio_unit(unit)
+        if keep_original:
+            new_text = ""
+        elif _is_narration_unit(unit):
+            new_text = old_text if passthrough_narration else unit_rewrites.get(uid, "")
+        else:
+            new_text = ""
+        row = {
+            "unit_id": uid,
+            "role": str(unit.get("role") or "narration"),
+            "action": str(unit.get("action") or ("play_original_audio" if keep_original else "rewrite")),
+            "old_text": old_text,
+            "new_text": new_text,
+            "keep_original_audio": keep_original,
+            "related_range_ids": unit.get("related_range_ids") or [],
+        }
+        if unit.get("matched_movie_subtitles"):
+            row["matched_movie_subtitles"] = unit.get("matched_movie_subtitles") or []
+        rewritten_units.append(row)
+    return rewritten_units
+
+
+def _segment_new_text_from_units(rewritten_units: list[dict[str, Any]]) -> str:
+    return _join_text([str(unit.get("new_text") or "") for unit in rewritten_units if not unit.get("keep_original_audio")])
+
+
 def _build_batch_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     rewrite_input = []
+    has_units = any(_text_units(item) for item in items)
     for item in items:
         ranges = item.get("movie_time_ranges") or []
-        rewrite_input.append(
-            {
-                "segment_id": item.get("segment_id"),
-                "old_text": item.get("old_text") or item.get("text") or "",
-                "text_role": item.get("text_role") or "narration",
-                "ref_time_range": item.get("ref_time_range") or {},
-                "movie_time_ranges": [
-                    {
-                        "start": r.get("start"),
-                        "end": r.get("end"),
-                        "confidence": r.get("confidence"),
-                    }
-                    for r in ranges
-                ],
-            }
-        )
-    return {
-        "task": "rewrite_narration_segments",
-        "input": rewrite_input,
-        "output_schema": {
+        payload_item = {
+            "segment_id": item.get("segment_id"),
+            "old_text": item.get("old_text") or item.get("text") or "",
+            "text_role": item.get("text_role") or "narration",
+            "segment_audio_role": item.get("segment_audio_role"),
+            "ref_time_range": item.get("ref_time_range") or {},
+            "movie_time_ranges": [
+                {
+                    "start": r.get("start"),
+                    "end": r.get("end"),
+                    "confidence": r.get("confidence"),
+                    "audio_action": r.get("audio_action"),
+                }
+                for r in ranges
+            ],
+        }
+        units = _text_units(item)
+        if units:
+            payload_item["text_units"] = [
+                {
+                    "unit_id": _unit_id(unit, idx),
+                    "old_text": _unit_text(unit),
+                    "role": unit.get("role") or "narration",
+                    "action": unit.get("action") or "rewrite",
+                }
+                for idx, unit in enumerate(units, start=1)
+                if _is_narration_unit(unit)
+            ]
+        rewrite_input.append(payload_item)
+    if has_units:
+        output_schema = {
+            "rewritten_script": [
+                {
+                    "segment_id": "seg_without_text_units",
+                    "new_text": "新的中文解说文案",
+                }
+            ],
+            "rewritten_units": [
+                {
+                    "unit_id": "seg_001_unit_001",
+                    "new_text": "新的中文解说文案",
+                }
+            ]
+        }
+    else:
+        output_schema = {
             "rewritten_script": [
                 {
                     "segment_id": "seg_001",
                     "new_text": "新的中文解说文案",
                 }
             ]
-        },
+        }
+    return {
+        "task": "rewrite_narration_segments",
+        "input": rewrite_input,
+        "output_schema": output_schema,
     }
 
 
@@ -104,10 +200,19 @@ async def _call_ai_batch(
         response = await provider.chat_completion(messages)
 
     parsed = _extract_json(response.content)
+    unit_rows = parsed.get("rewritten_units") or []
+    result: dict[str, str] = {}
+    if isinstance(unit_rows, list):
+        for row in unit_rows:
+            if not isinstance(row, dict):
+                continue
+            unit_id = str(row.get("unit_id") or "")
+            new_text = str(row.get("new_text") or "").strip()
+            if unit_id and new_text:
+                result[unit_id] = new_text
     rows = parsed.get("rewritten_script") or []
     if not isinstance(rows, list):
         raise ValueError("AI JSON 缺少 rewritten_script 数组")
-    result: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -115,6 +220,13 @@ async def _call_ai_batch(
         new_text = str(row.get("new_text") or "").strip()
         if seg_id and new_text:
             result[seg_id] = new_text
+        for unit in row.get("rewritten_units") or []:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = str(unit.get("unit_id") or "")
+            unit_text = str(unit.get("new_text") or "").strip()
+            if unit_id and unit_text:
+                result[unit_id] = unit_text
     return result
 
 
@@ -129,14 +241,18 @@ def pass_through_script(
         seg_id = str(item.get("segment_id") or "")
         old_text = str(item.get("old_text") or item.get("text") or "")
         role = str(item.get("text_role") or "narration")
+        rewritten_units = _build_rewritten_units(item, unit_rewrites={}, passthrough_narration=True)
+        new_text = _segment_new_text_from_units(rewritten_units) if rewritten_units else old_text
         rewritten.append(
             {
                 "segment_id": seg_id,
                 "old_text": old_text,
-                "new_text": old_text,
+                "new_text": new_text,
                 "old_char_count": _char_len(old_text),
-                "new_char_count": _char_len(old_text),
+                "new_char_count": _char_len(new_text),
                 "text_role": role,
+                "segment_audio_role": item.get("segment_audio_role"),
+                "rewritten_units": rewritten_units,
                 "ref_time_range": item.get("ref_time_range") or {},
                 "movie_time_ranges": item.get("movie_time_ranges") or [],
                 "rewrite_status": "original",
@@ -194,9 +310,22 @@ async def rewrite_script(
                 seg_id = str(item.get("segment_id") or "")
                 old_text = str(item.get("old_text") or "")
                 role = str(item.get("text_role") or "narration")
-                new_text = ai_rows.get(seg_id)
-                if not new_text:
-                    raise ValueError(f"AI 返回缺少 segment_id={seg_id} 的 new_text")
+                units = _text_units(item)
+                if units:
+                    missing_units = [
+                        _unit_id(unit, idx)
+                        for idx, unit in enumerate(units, start=1)
+                        if _is_narration_unit(unit) and not ai_rows.get(_unit_id(unit, idx))
+                    ]
+                    if missing_units:
+                        raise ValueError(f"AI 返回缺少 narration unit 的 new_text: {', '.join(missing_units)}")
+                    rewritten_units = _build_rewritten_units(item, unit_rewrites=ai_rows, passthrough_narration=False)
+                    new_text = _segment_new_text_from_units(rewritten_units)
+                else:
+                    new_text = ai_rows.get(seg_id)
+                    if not new_text:
+                        raise ValueError(f"AI 返回缺少 segment_id={seg_id} 的 new_text")
+                    rewritten_units = []
                 rewritten.append(
                     {
                         "segment_id": seg_id,
@@ -205,6 +334,8 @@ async def rewrite_script(
                         "old_char_count": _char_len(old_text),
                         "new_char_count": _char_len(new_text),
                         "text_role": role,
+                        "segment_audio_role": item.get("segment_audio_role"),
+                        "rewritten_units": rewritten_units,
                         "ref_time_range": item.get("ref_time_range") or {},
                         "movie_time_ranges": item.get("movie_time_ranges") or [],
                         "rewrite_status": "ai_rewritten",

@@ -19,6 +19,11 @@ from utils.cli_bootstrap import add_project_to_syspath
 add_project_to_syspath()
 
 from clone_narration_video.utils.ffmpeg_utils import probe_duration, ffprobe_json, resolve_ffmpeg_bin, run_ffmpeg
+from clone_narration_video.utils.generate_video_audio_modes import (
+    audio_mode_for_item,
+    is_original_audio_item,
+    original_audio_result,
+)
 from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir, relpath, resolve_existing_path
@@ -174,6 +179,14 @@ def _video_codec_args(encoder: str) -> list[str]:
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
 
 
+def _audio_codec_args() -> list[str]:
+    return ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+
+
+def _audio_pts_filter() -> str:
+    return "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
+
+
 def _item_duration_from_clips(item: dict[str, Any]) -> float:
     total = 0.0
     for clip in item.get("video_clips") or []:
@@ -230,6 +243,9 @@ async def _synthesize_one(
     proxy: str | None,
     reuse: bool,
 ) -> dict[str, Any]:
+    if is_original_audio_item(item):
+        return original_audio_result(item)
+
     item_id = str(item.get("item_id") or item.get("segment_id") or uuid.uuid4().hex[:8])
     narration = str(item.get("narration") or "").strip()
     out_path = audio_dir / f"{_safe_name(item_id, 'item')}.mp3"
@@ -306,7 +322,8 @@ async def synthesize_timeline_audio(
                 proxy=proxy,
                 reuse=reuse,
             )
-            print(f"[tts] {key} {result['duration']:.3f}s")
+            label = "original" if result.get("original_audio") else "tts"
+            print(f"[{label}] {key} {result['duration']:.3f}s")
             async with lock:
                 completed += 1
                 if progress_callback:
@@ -317,30 +334,56 @@ async def synthesize_timeline_audio(
     return dict(pairs)
 
 
-def _cut_video_clip(source: Path, start: float, duration: float, out_path: Path, *, encoder: str) -> Path:
+def _cut_video_clip(
+    source: Path,
+    start: float,
+    duration: float,
+    out_path: Path,
+    *,
+    encoder: str,
+    keep_audio: bool = False,
+    audio_volume: float = 1.0,
+) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    run_ffmpeg(
-        [
-            resolve_ffmpeg_bin(),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-ss",
-            f"{max(0.0, start):.3f}",
-            "-t",
-            f"{max(0.03, duration):.3f}",
-            "-i",
-            str(source),
+    cmd = [
+        resolve_ffmpeg_bin(),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{max(0.0, start):.3f}",
+        "-t",
+        f"{max(0.03, duration):.3f}",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+    ]
+    if keep_audio:
+        cmd += [
             "-map",
-            "0:v:0",
+            "0:a?",
+            "-vf",
+            "setsar=1,format=yuv420p",
+            *_video_codec_args(encoder),
+        ]
+        if audio_volume != 1.0:
+            cmd += ["-af", f"volume={max(0.0, float(audio_volume)):.3f},{_audio_pts_filter()}"]
+        else:
+            cmd += ["-af", _audio_pts_filter()]
+        cmd += [*_audio_codec_args(), "-movflags", "+faststart"]
+    else:
+        cmd += [
             "-an",
             "-vf",
             "setsar=1,format=yuv420p",
             *_video_codec_args(encoder),
-            str(out_path),
+            "-movflags",
+            "+faststart",
         ]
-    )
+    cmd.append(str(out_path))
+    run_ffmpeg(cmd)
     return out_path
 
 
@@ -363,6 +406,8 @@ def _concat_videos(paths: list[Path], out_path: Path, *, reencode: bool = False,
         "-loglevel",
         "error",
         "-y",
+        "-fflags",
+        "+genpts",
         "-f",
         "concat",
         "-safe",
@@ -375,10 +420,11 @@ def _concat_videos(paths: list[Path], out_path: Path, *, reencode: bool = False,
             "-vf",
             "setsar=1,format=yuv420p",
             *_video_codec_args(encoder),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
+            "-af",
+            _audio_pts_filter(),
+            *_audio_codec_args(),
+            "-movflags",
+            "+faststart",
         ]
     else:
         cmd += ["-c", "copy"]
@@ -403,18 +449,13 @@ def _mux_item_with_audio(visual_path: Path, audio_path: Path, out_path: Path, du
             "-i",
             str(audio_path),
             "-filter_complex",
-            f"[0:v]{vf}[v];[1:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS[a]",
+            f"[0:v]{vf}[v];[1:a]atrim=0:{duration:.3f},{_audio_pts_filter()}[a]",
             "-map",
             "[v]",
             "-map",
             "[a]",
             *_video_codec_args(encoder),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "48000",
+            *_audio_codec_args(),
             "-movflags",
             "+faststart",
             str(out_path),
@@ -443,10 +484,16 @@ def render_video(
     total_items = len(items)
     for item_index, item in enumerate(items, start=1):
         key = str(item.get("item_id") or item.get("segment_id") or f"item_{item_index:03d}")
-        audio = audio_results[key]
-        audio_path = Path(str(audio["path"]))
-        audio_duration = float(audio["duration"])
-        clips = _retime_clips_to_audio(item, audio_duration)
+        audio_mode = audio_mode_for_item(item)
+        if audio_mode == "original":
+            audio = audio_results.get(key) or original_audio_result(item)
+            audio_duration = _item_duration_from_clips(item)
+            clips = [c for c in (item.get("video_clips") or []) if isinstance(c, dict)]
+        else:
+            audio = audio_results[key]
+            audio_path = Path(str(audio["path"]))
+            audio_duration = float(audio["duration"])
+            clips = _retime_clips_to_audio(item, audio_duration)
         if not clips:
             raise ValueError(f"{key} 没有可用 video_clips")
 
@@ -457,15 +504,25 @@ def render_video(
             end = float(clip.get("movie_end") or 0.0)
             duration = max(0.03, end - start)
             clip_path = tmp_dir / f"{item_index:04d}_{clip_index:03d}.mp4"
-            _cut_video_clip(source, start, duration, clip_path, encoder=selected_encoder)
+            _cut_video_clip(
+                source,
+                start,
+                duration,
+                clip_path,
+                encoder=selected_encoder,
+                keep_audio=audio_mode == "original",
+            )
             clip_paths.append(clip_path)
 
-        visual_path = tmp_dir / f"{item_index:04d}_visual.mp4"
-        _concat_videos(clip_paths, visual_path)
         item_path = tmp_dir / f"{item_index:04d}_narrated.mp4"
-        _mux_item_with_audio(visual_path, audio_path, item_path, audio_duration, encoder=selected_encoder)
+        if audio_mode == "original":
+            _concat_videos(clip_paths, item_path, reencode=True, encoder=selected_encoder)
+        else:
+            visual_path = tmp_dir / f"{item_index:04d}_visual.mp4"
+            _concat_videos(clip_paths, visual_path)
+            _mux_item_with_audio(visual_path, audio_path, item_path, audio_duration, encoder=selected_encoder)
         item_paths.append(item_path)
-        print(f"[video] {key} clips={len(clip_paths)} {audio_duration:.3f}s")
+        print(f"[video] {key} mode={audio_mode} clips={len(clip_paths)} {audio_duration:.3f}s")
         if progress_callback:
             progress_callback((item_index / max(1, total_items)) * 85.0, f"Rendered video segments {item_index}/{total_items}")
 
@@ -653,10 +710,13 @@ def generate_jianying_draft(
 
     for item_index, item in enumerate(items, start=1):
         key = str(item.get("item_id") or item.get("segment_id") or f"item_{item_index:03d}")
-        audio = audio_results[key]
-        audio_src = Path(str(audio["path"]))
-        audio_dur = float(audio["duration"])
-        clips = _retime_clips_to_audio(item, audio_dur)
+        audio_mode = audio_mode_for_item(item)
+        if audio_mode == "original":
+            audio = original_audio_result(item)
+            clips = [c for c in (item.get("video_clips") or []) if isinstance(c, dict)]
+        else:
+            audio = audio_results[key]
+            clips = _retime_clips_to_audio(item, float(audio["duration"]))
         item_start_us = timeline_cursor_us
         item_duration_us = 0
 
@@ -700,7 +760,7 @@ def generate_jianying_draft(
                     "keyframe_refs": [],
                     "source_timerange": {"start": _s_to_us(start), "duration": duration_us},
                     "speed": 1,
-                    "volume": 0,
+                    "volume": 1 if audio_mode == "original" else 0,
                     "extra_material_refs": [speed_id],
                     "clip": {"alpha": 1, "flip": {"horizontal": False, "vertical": False}, "rotation": 0, "scale": {"x": 1, "y": 1}, "transform": {"x": 0, "y": 0}},
                     "uniform_scale": {"on": True, "value": 1},
@@ -711,6 +771,13 @@ def generate_jianying_draft(
             timeline_cursor_us += duration_us
             item_duration_us += duration_us
 
+        if audio_mode == "original":
+            if progress_callback and (item_index == 1 or item_index == total_items or item_index % 10 == 0):
+                progress_callback((item_index / max(1, total_items)) * 70.0, f"Built draft timeline {item_index}/{total_items}")
+            continue
+
+        audio_src = Path(str(audio["path"]))
+        audio_dur = float(audio["duration"])
         copied_audio = _copy_unique(audio_src, assets_audio_dir)
         audio_key = str(copied_audio)
         audio_duration_us = _s_to_us(audio_dur)
@@ -835,6 +902,23 @@ def write_manifest(output_dir: Path, payload: dict[str, Any]) -> Path:
     return write_json(output_dir / "generate_video_result.json", payload)
 
 
+def _serialize_audio_results(audio_results: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for key, value in audio_results.items():
+        path = str(value.get("path") or "")
+        row = {
+            "path": relpath(path) if path else "",
+            "duration": value.get("duration"),
+        }
+        for flag in ("original_audio", "silent", "reused"):
+            if flag in value:
+                row[flag] = value[flag]
+        if "voice_id" in value:
+            row["voice_id"] = value["voice_id"]
+        rows[key] = row
+    return rows
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="第 8 步：生成剪映草稿或直接合成视频")
     parser.add_argument("--timeline", default=r".\outputs\7_timeline_composer\final_timeline.json")
@@ -873,7 +957,7 @@ async def async_main(args: argparse.Namespace) -> None:
         "mode": args.mode,
         "timeline": str(args.timeline),
         "audio_dir": relpath(output_dir / "audio"),
-        "audio_results": {k: {"path": relpath(v["path"]), "duration": v["duration"]} for k, v in audio_results.items()},
+        "audio_results": _serialize_audio_results(audio_results),
     }
     if args.mode in {"draft", "both"}:
         draft_root = Path(args.jianying_draft_dir).resolve() if args.jianying_draft_dir else None
