@@ -199,7 +199,12 @@ def _item_duration_from_clips(item: dict[str, Any]) -> float:
     return _round(total)
 
 
-def _retime_clips_to_audio(item: dict[str, Any], target_duration: float) -> list[dict[str, Any]]:
+def _retime_clips_to_audio(
+    item: dict[str, Any],
+    target_duration: float,
+    *,
+    keep_freeze_padding: bool = False,
+) -> list[dict[str, Any]]:
     clips = [c for c in (item.get("video_clips") or []) if isinstance(c, dict)]
     if not clips:
         return []
@@ -227,6 +232,8 @@ def _retime_clips_to_audio(item: dict[str, Any], target_duration: float) -> list
         return adjusted
 
     adjusted = [dict(c) for c in clips]
+    if keep_freeze_padding and float(item.get("freeze_padding") or 0.0) > 0.03:
+        return adjusted
     extra = target_duration - current
     last = adjusted[-1]
     last["movie_end"] = _round(float(last.get("movie_end") or 0.0) + extra)
@@ -387,6 +394,55 @@ def _cut_video_clip(
     return out_path
 
 
+def _default_video_meta(items: list[dict[str, Any]]) -> dict[str, Any]:
+    for item in items:
+        for clip in item.get("video_clips") or []:
+            if not isinstance(clip, dict):
+                continue
+            source = str(clip.get("source") or "").strip()
+            if not source:
+                continue
+            try:
+                return _probe_video_meta(_source_path(source))
+            except Exception:
+                continue
+    return {"width": 1920, "height": 1080, "fps": 30.0}
+
+
+def _generate_black_clip(
+    duration: float,
+    out_path: Path,
+    *,
+    encoder: str,
+    width: int = 1920,
+    height: int = 1080,
+    fps: float = 30.0,
+) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s={width}x{height}:r={fps:.3f}",
+            "-t",
+            f"{max(0.03, duration):.3f}",
+            "-vf",
+            "setsar=1,format=yuv420p",
+            *_video_codec_args(encoder),
+            "-movflags",
+            "+faststart",
+            str(out_path),
+        ]
+    )
+    return out_path
+
+
 def _concat_videos(paths: list[Path], out_path: Path, *, reencode: bool = False, encoder: str = "auto") -> Path:
     if not paths:
         raise ValueError("没有可拼接的视频片段")
@@ -480,6 +536,7 @@ def render_video(
     item_paths: list[Path] = []
     selected_encoder = _select_video_encoder(encoder)
     print(f"[video] encoder={selected_encoder}")
+    video_meta = _default_video_meta(items)
 
     total_items = len(items)
     for item_index, item in enumerate(items, start=1):
@@ -493,11 +550,26 @@ def render_video(
             audio = audio_results[key]
             audio_path = Path(str(audio["path"]))
             audio_duration = float(audio["duration"])
-            clips = _retime_clips_to_audio(item, audio_duration)
-        if not clips:
-            raise ValueError(f"{key} 没有可用 video_clips")
+            clips = _retime_clips_to_audio(item, audio_duration, keep_freeze_padding=True)
 
         clip_paths: list[Path] = []
+        if not clips:
+            fallback_duration = audio_duration if audio_mode != "original" else float(item.get("tts_duration") or 0.0)
+            if fallback_duration <= 0.03:
+                status = item.get("allocation_status") or "unknown"
+                raise ValueError(f"{key} 没有可用 video_clips (allocation_status={status})")
+            status = str(item.get("allocation_status") or "unknown")
+            print(f"[video] {key} warning: no video_clips ({status}), black placeholder {fallback_duration:.3f}s")
+            clip_paths.append(
+                _generate_black_clip(
+                    fallback_duration,
+                    tmp_dir / f"{item_index:04d}_001.mp4",
+                    encoder=selected_encoder,
+                    width=int(video_meta["width"]),
+                    height=int(video_meta["height"]),
+                    fps=float(video_meta["fps"]),
+                )
+            )
         for clip_index, clip in enumerate(clips, start=1):
             source = _source_path(str(clip.get("source") or ""))
             start = float(clip.get("movie_start") or 0.0)
@@ -919,6 +991,205 @@ def _serialize_audio_results(audio_results: dict[str, dict[str, Any]]) -> dict[s
     return rows
 
 
+def _srt_time_to_seconds(value: str) -> float:
+    text = value.strip().replace(".", ",")
+    match = re.match(r"(\d+):(\d+):(\d+),(\d+)", text)
+    if not match:
+        return 0.0
+    hours, minutes, seconds, millis = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000.0
+
+
+def _parse_srt(path: Path | None) -> list[dict[str, Any]]:
+    if not path or not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    raw = path.read_text(encoding="utf-8", errors="ignore").strip()
+    for block in re.split(r"\n\s*\n", raw):
+        lines = [ln for ln in block.splitlines() if ln.strip()]
+        ts_index = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        if ts_index is None:
+            continue
+        parts = lines[ts_index].split("-->")
+        if len(parts) != 2:
+            continue
+        start = _srt_time_to_seconds(parts[0])
+        end = _srt_time_to_seconds(parts[1])
+        text = " ".join(lines[ts_index + 1:]).strip()
+        if text:
+            entries.append({"start": start, "end": end, "text": text})
+    return entries
+
+
+def _subtitle_text_in_range(subs: list[dict[str, Any]], start: float, end: float) -> str:
+    if not subs or end <= start:
+        return ""
+    texts: list[str] = []
+    for sub in subs:
+        overlap = min(end, float(sub["end"])) - max(start, float(sub["start"]))
+        if overlap > 0.001:
+            texts.append(str(sub["text"]))
+    return " ".join(texts).strip()
+
+
+def _find_pipeline_file(timeline_path: Path, module: str, filename: str) -> Path | None:
+    candidates: list[Path] = []
+    try:
+        candidates.append(timeline_path.resolve().parents[1] / module / filename)
+    except Exception:
+        pass
+    candidates.append(resolve_existing_path(f"outputs/{module}/{filename}"))
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            return candidate
+    return None
+
+
+def _load_segment_texts(timeline_path: Path) -> dict[str, str]:
+    path = _find_pipeline_file(timeline_path, "2_narration_segmenter", "narration_segments.json")
+    if not path:
+        return {}
+    try:
+        data = read_json(path)
+    except Exception:
+        return {}
+    result: dict[str, str] = {}
+    for seg in data.get("narration_segments") or []:
+        if isinstance(seg, dict):
+            sid = str(seg.get("segment_id") or "")
+            if sid:
+                result[sid] = str(seg.get("text") or "")
+    return result
+
+
+def _load_ref_shot_ranges(timeline_path: Path) -> dict[str, tuple[float, float]]:
+    path = _find_pipeline_file(timeline_path, "1_reference_analyzer", "ref_analysis.json")
+    if not path:
+        return {}
+    try:
+        data = read_json(path)
+    except Exception:
+        return {}
+    result: dict[str, tuple[float, float]] = {}
+    for shot in data.get("ref_shots") or []:
+        if isinstance(shot, dict):
+            sid = str(shot.get("ref_shot_id") or "")
+            if sid:
+                result[sid] = (float(shot.get("start") or 0.0), float(shot.get("end") or 0.0))
+    return result
+
+
+def build_shot_breakdown(
+    items: list[dict[str, Any]],
+    audio_results: dict[str, dict[str, Any]],
+    timeline_path: Path,
+) -> list[dict[str, Any]]:
+    """以镜头（video_clip）为条目，汇总每个镜头在成片中的信息。
+
+    缺失数据会回退到整条流水线的中间产物（参考分析、文案分段、字幕）查找。
+    """
+    segment_texts = _load_segment_texts(timeline_path)
+    ref_shot_ranges = _load_ref_shot_ranges(timeline_path)
+    movie_subs = _parse_srt(_find_pipeline_file(timeline_path, "5_audio_role_classifier", "movie_subtitle.srt"))
+    ref_subs = _parse_srt(_find_pipeline_file(timeline_path, "1_reference_analyzer", "ref_subtitle.srt"))
+
+    shots: list[dict[str, Any]] = []
+    cursor = 0.0
+    for item_index, item in enumerate(items, start=1):
+        key = str(item.get("item_id") or item.get("segment_id") or f"item_{item_index:03d}")
+        audio_mode = audio_mode_for_item(item)
+        is_original = audio_mode == "original"
+        narration = str(item.get("narration") or "").strip()
+        segment_id = str(item.get("segment_id") or "")
+        segment_text = segment_texts.get(segment_id, "")
+        raw_clips = [c for c in (item.get("video_clips") or []) if isinstance(c, dict)]
+        audio_duration = 0.0
+        if is_original:
+            clips = raw_clips
+        else:
+            audio = audio_results.get(key) or {}
+            audio_duration = float(audio.get("duration") or 0.0)
+            clips = _retime_clips_to_audio(item, audio_duration, keep_freeze_padding=True) if audio_duration > 0 else raw_clips
+
+        ref_source = item.get("ref_source") or {}
+        item_ref_start = float(ref_source.get("ref_start") or 0.0)
+        item_ref_end = float(ref_source.get("ref_end") or 0.0)
+        visual_duration = 0.0
+        last_movie_end = 0.0
+
+        for clip in clips:
+            movie_start = float(clip.get("movie_start") or 0.0)
+            movie_end = float(clip.get("movie_end") or 0.0)
+            duration = max(0.0, movie_end - movie_start)
+            visual_duration += duration
+            last_movie_end = movie_end
+            start = cursor
+            end = cursor + duration
+            cursor = end
+
+            ref_shot_id = clip.get("source_ref_shot_id")
+            ref_range = ref_shot_ranges.get(ref_shot_id) if ref_shot_id else None
+            if ref_range:
+                ref_subtitle = _subtitle_text_in_range(ref_subs, ref_range[0], ref_range[1])
+            else:
+                ref_subtitle = _subtitle_text_in_range(ref_subs, item_ref_start, item_ref_end)
+
+            shots.append(
+                {
+                    "item_id": key,
+                    "clip_id": clip.get("clip_id"),
+                    "segment_id": segment_id,
+                    "start": _round(start),
+                    "end": _round(end),
+                    "duration": _round(duration),
+                    "is_original_play": is_original,
+                    "narration": narration,
+                    "segment_text": segment_text,
+                    "shot_subtitle": _subtitle_text_in_range(movie_subs, movie_start, movie_end),
+                    "ref_subtitle": ref_subtitle,
+                    "movie_start": _round(movie_start),
+                    "movie_end": _round(movie_end),
+                    "source_ref_shot_id": ref_shot_id,
+                    "movie_shot_ids": clip.get("movie_shot_ids") or [],
+                }
+            )
+        freeze_padding = _round(max(0.0, audio_duration - visual_duration)) if not is_original else 0.0
+        if freeze_padding > 0.03 and float(item.get("freeze_padding") or 0.0) > 0.03:
+            start = cursor
+            end = cursor + freeze_padding
+            cursor = end
+            shots.append(
+                {
+                    "item_id": key,
+                    "clip_id": "freeze_padding",
+                    "segment_id": segment_id,
+                    "start": _round(start),
+                    "end": _round(end),
+                    "duration": _round(freeze_padding),
+                    "is_original_play": False,
+                    "narration": narration,
+                    "segment_text": segment_text,
+                    "shot_subtitle": "",
+                    "ref_subtitle": _subtitle_text_in_range(ref_subs, item_ref_start, item_ref_end),
+                    "movie_start": _round(last_movie_end),
+                    "movie_end": _round(last_movie_end),
+                    "source_ref_shot_id": None,
+                    "movie_shot_ids": [],
+                    "allocation": "freeze_padding",
+                }
+            )
+    return shots
+
+
+def write_shot_breakdown(output_dir: Path, shots: list[dict[str, Any]]) -> Path:
+    payload = {
+        "shot_count": len(shots),
+        "total_duration": _round(shots[-1]["end"]) if shots else 0.0,
+        "shots": shots,
+    }
+    return write_json(output_dir / "shot_breakdown.json", payload)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="第 8 步：生成剪映草稿或直接合成视频")
     parser.add_argument("--timeline", default=r".\outputs\7_timeline_composer\final_timeline.json")
@@ -987,9 +1258,15 @@ async def async_main(args: argparse.Namespace) -> None:
             ),
         )
 
+    shots = build_shot_breakdown(items, audio_results, resolve_existing_path(args.timeline))
+    shot_breakdown_path = write_shot_breakdown(output_dir, shots)
+    result["shot_breakdown"] = relpath(shot_breakdown_path)
+    result["shot_count"] = len(shots)
+
     manifest = write_manifest(output_dir, result)
     emit_progress("render", 100, "Video generation complete")
     print(manifest)
+    print(shot_breakdown_path)
 
 
 def main() -> None:

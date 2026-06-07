@@ -11,6 +11,7 @@ from utils.cli_bootstrap import add_project_to_syspath
 add_project_to_syspath()
 
 from clone_narration_video.utils.json_io import read_json, write_json
+from clone_narration_video.utils.movie_time_ranges import merge_overlapping_movie_ranges
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 
@@ -37,19 +38,22 @@ def bind_script_visual(
     for idx, seg in enumerate(narration_segments):
         ranges = []
         for ref_id in seg.get("ref_shot_ids") or []:
-            match = by_ref.get(str(ref_id))
+            ref_key = str(ref_id)
+            match = by_ref.get(ref_key)
             if not match or match.get("status") not in ACCEPTED_VISUAL_STATUSES:
                 continue
+            movie_shot_ids = [str(x) for x in match.get("movie_shot_ids") or []]
             ranges.append(
                 {
                     "start": match.get("movie_start"),
                     "end": match.get("movie_end"),
-                    "source_ref_shot_id": ref_id,
-                    "movie_shot_ids": match.get("movie_shot_ids") or [],
+                    "source_ref_shot_id": ref_key,
+                    "movie_shot_ids": movie_shot_ids,
                     "confidence": match.get("confidence") or "low",
                     "match_score": match.get("match_score") or 0.0,
                 }
             )
+        ranges = merge_overlapping_movie_ranges(ranges)
         script_mapping.append(
             {
                 "segment_id": seg.get("segment_id"),

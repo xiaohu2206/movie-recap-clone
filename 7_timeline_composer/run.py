@@ -12,7 +12,10 @@ from utils.cli_bootstrap import add_project_to_syspath
 add_project_to_syspath()
 
 from clone_narration_video.utils.json_io import read_json, write_json
+from clone_narration_video.utils.movie_time_ranges import merge_overlapping_movie_ranges
 from clone_narration_video.utils.project_paths import default_output_dir
+
+MIN_ORIGINAL_PLAY_DURATION = 3.0
 
 
 def _round(value: float) -> float:
@@ -75,6 +78,13 @@ def _base_ranges(item: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         ranges.append(row)
     return ranges
+
+
+def _prepare_movie_ranges(
+    item: dict[str, Any],
+    movie_shots: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    return merge_overlapping_movie_ranges(_base_ranges(item))
 
 
 def _range_id(row: dict[str, Any], index: int) -> str:
@@ -140,15 +150,67 @@ def _ranges_for_ids(ids: list[str], by_id: dict[str, dict[str, Any]]) -> list[di
     return [by_id[range_id] for range_id in ids if range_id in by_id]
 
 
+def _filter_range_ids_for_audio_mode(
+    range_ids: list[str],
+    by_id: dict[str, dict[str, Any]],
+    audio_mode: str,
+) -> list[str]:
+    filtered: list[str] = []
+    for range_id in range_ids:
+        row = by_id.get(str(range_id))
+        if not row:
+            continue
+        row_mode = _audio_mode_from_action(_audio_action(row))
+        if audio_mode == "original":
+            if row_mode == "original":
+                filtered.append(str(range_id))
+        elif audio_mode == "mixed":
+            if row_mode in {"mixed", "voiceover"}:
+                filtered.append(str(range_id))
+        elif row_mode != "original":
+            filtered.append(str(range_id))
+    return filtered
+
+
+def _unused_ranges(
+    range_ids: list[str],
+    by_id: dict[str, dict[str, Any]],
+    consumed_range_ids: set[str],
+) -> list[dict[str, Any]]:
+    fresh_ids = [str(rid) for rid in range_ids if str(rid) and str(rid) not in consumed_range_ids]
+    return _ranges_for_ids(fresh_ids, by_id)
+
+
+def _drop_rendered_voiceover_ranges(
+    ranges: list[dict[str, Any]],
+    rendered_movie_shot_ids: set[str],
+) -> list[dict[str, Any]]:
+    return ranges
+
+
+def _min_range_start(ranges: list[dict[str, Any]]) -> float | None:
+    starts = [float(row.get("start") or 0.0) for row in ranges if _duration(row.get("start"), row.get("end")) > 0]
+    return min(starts) if starts else None
+
+
+def _has_short_original_play_range(ranges: list[dict[str, Any]]) -> bool:
+    return any(
+        0.0 < _duration(row.get("start"), row.get("end")) <= MIN_ORIGINAL_PLAY_DURATION
+        for row in merge_overlapping_movie_ranges(ranges)
+    )
+
+
 def _clips_from_ranges(
     ranges: list[dict[str, Any]],
     *,
     source: str,
     audio_mode: str,
     allocation: str,
+    movie_shots: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     clips = []
-    for row in ranges:
+    prepared = merge_overlapping_movie_ranges(ranges)
+    for row in prepared:
         clip = _clip(
             len(clips) + 1,
             float(row.get("start") or 0.0),
@@ -190,9 +252,12 @@ def _range_audio_decision(audio_mode: str, ranges: list[dict[str, Any]]) -> dict
         "original": "play_original_audio",
         "mixed": "play_original_audio_low_volume",
     }.get(audio_mode, "rewrite_and_voiceover")
+    action = actions[0] if len(set(actions)) == 1 else default_action
+    if _audio_mode_from_action(action) != audio_mode:
+        action = default_action
     return {
         "audio_role": roles[0] if len(set(roles)) == 1 else default_role,
-        "audio_action": actions[0] if len(set(actions)) == 1 else default_action,
+        "audio_action": action,
         "source_range_ids": source_range_ids,
     }
 
@@ -222,6 +287,8 @@ def _chunk_by_units(item: dict[str, Any], all_ranges: list[dict[str, Any]], by_i
         range_ids = _range_ids_for_unit(unit, by_id)
         ranges = _ranges_for_ids(range_ids, by_id)
         mode = _unit_audio_mode(unit, ranges)
+        range_ids = _filter_range_ids_for_audio_mode(range_ids, by_id, mode)
+        ranges = _ranges_for_ids(range_ids, by_id)
         if not ranges and mode == "original":
             continue
         narration_text = "" if mode == "original" else _unit_text(unit, "new_text")
@@ -272,10 +339,12 @@ def _extend_with_adjacent_shots(
     movie_shots: list[dict[str, Any]],
     remaining: float,
     source: str,
+    reserved_movie_shot_ids: set[str] | None = None,
+    max_movie_end: float | None = None,
 ) -> tuple[float, bool]:
     if remaining <= 0 or not ranges or not movie_shots:
         return remaining, False
-    used = _used_movie_shot_ids(ranges)
+    used = _used_movie_shot_ids(ranges) | set(reserved_movie_shot_ids or set())
     last_end = max(float(row.get("end") or 0.0) for row in ranges)
     extended = False
     for shot in movie_shots:
@@ -284,8 +353,14 @@ def _extend_with_adjacent_shots(
         shot_id = str(shot.get("movie_shot_id") or "")
         start = float(shot.get("start") or 0.0)
         end = float(shot.get("end") or 0.0)
+        if max_movie_end is not None and start >= max_movie_end - 0.001:
+            break
         if shot_id in used or end <= start or start < last_end - 0.05:
             continue
+        if max_movie_end is not None:
+            end = min(end, max_movie_end)
+            if end <= start:
+                break
         take = min(end - start, remaining)
         clips.append(
             _clip(
@@ -309,7 +384,7 @@ def allocate_video_clips(
     source: str,
     movie_shots: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], str]:
-    ranges = _base_ranges(item)
+    ranges = _prepare_movie_ranges(item, movie_shots)
     if not ranges:
         return [], "missing_visual_ranges"
 
@@ -356,8 +431,21 @@ def allocate_video_clips(
         )
 
     remaining = _round(tts_duration - available)
-    remaining, used_adjacent = _extend_with_adjacent_shots(clips, ranges, movie_shots, remaining, source)
+    reserved_movie_shot_ids = {str(x) for x in item.get("reserved_movie_shot_ids") or []}
+    max_movie_end = item.get("max_extension_movie_end")
+    max_movie_end = float(max_movie_end) if max_movie_end is not None else None
+    remaining, used_adjacent = _extend_with_adjacent_shots(
+        clips,
+        ranges,
+        movie_shots,
+        remaining,
+        source,
+        reserved_movie_shot_ids=reserved_movie_shot_ids,
+        max_movie_end=max_movie_end,
+    )
     if remaining > 0.03 and clips:
+        if max_movie_end is not None:
+            return clips, "padded_with_freeze"
         clips[-1]["movie_end"] = _round(float(clips[-1]["movie_end"]) + remaining)
         clips[-1]["duration"] = _round(float(clips[-1]["duration"]) + remaining)
         clips[-1]["allocation"] = "synthetic_extension"
@@ -388,11 +476,19 @@ def _timeline_item(
     cursor: float,
     source: str,
     movie_shots: list[dict[str, Any]],
+    reserved_movie_shot_ids: set[str],
+    max_extension_movie_end: float | None,
     chars_per_second: float,
     min_duration: float,
 ) -> tuple[dict[str, Any], float]:
     if audio_mode == "original":
-        clips = _clips_from_ranges(ranges, source=source, audio_mode=audio_mode, allocation="original_audio")
+        clips = _clips_from_ranges(
+            ranges,
+            source=source,
+            audio_mode=audio_mode,
+            allocation="original_audio",
+            movie_shots=movie_shots,
+        )
         duration = _round(sum(float(clip.get("duration") or 0.0) for clip in clips))
         allocation_status = "original_audio"
         tts_duration = duration
@@ -402,6 +498,9 @@ def _timeline_item(
             tts_duration = _round(sum(_duration(row.get("start"), row.get("end")) for row in ranges))
         chunk_item = dict(item)
         chunk_item["movie_time_ranges"] = ranges
+        chunk_item["reserved_movie_shot_ids"] = sorted(reserved_movie_shot_ids | _used_movie_shot_ids(_base_ranges(item)))
+        if max_extension_movie_end is not None:
+            chunk_item["max_extension_movie_end"] = _round(max_extension_movie_end)
         clips, allocation_status = allocate_video_clips(
             chunk_item,
             tts_duration=tts_duration,
@@ -427,6 +526,11 @@ def _timeline_item(
         "confidence": _confidence({**item, "movie_time_ranges": ranges}, clips, allocation_status),
         "allocation_status": allocation_status,
     }
+    if audio_mode != "original":
+        visual_duration = _round(sum(float(clip.get("duration") or 0.0) for clip in clips))
+        freeze_padding = _round(max(0.0, duration - visual_duration))
+        if freeze_padding > 0.03:
+            row["freeze_padding"] = freeze_padding
     return row, end
 
 
@@ -437,6 +541,8 @@ def _compose_audio_aware_items(
     cursor: float,
     source: str,
     movie_shots: list[dict[str, Any]],
+    reserved_movie_shot_ids: set[str],
+    rendered_movie_shot_ids: set[str],
     chars_per_second: float,
     min_duration: float,
 ) -> tuple[list[dict[str, Any]], float]:
@@ -448,17 +554,39 @@ def _compose_audio_aware_items(
 
     rows: list[dict[str, Any]] = []
     next_index = start_index
-    for chunk in chunks:
+    consumed_range_ids: set[str] = set()
+    for chunk_index, chunk in enumerate(chunks):
         audio_mode = str(chunk.get("audio_mode") or "voiceover")
-        ranges = _ranges_for_ids([str(x) for x in chunk.get("range_ids") or []], by_id)
+        range_ids = [str(x) for x in chunk.get("range_ids") or []]
+        ranges = _unused_ranges(range_ids, by_id, consumed_range_ids)
+        if audio_mode in {"voiceover", "mixed"}:
+            ranges = _drop_rendered_voiceover_ranges(ranges, rendered_movie_shot_ids)
         chunk_units = [unit for unit in chunk.get("units") or [] if isinstance(unit, dict)]
+        demoted_short_original = audio_mode == "original" and _has_short_original_play_range(ranges)
+        if demoted_short_original:
+            audio_mode = "voiceover"
         if audio_mode == "original" and not ranges:
             continue
-        narration = _join_text([_unit_voiceover_text(unit) for unit in chunk_units if not unit.get("keep_original_audio")])
+        narration = _join_text(
+            [
+                _unit_voiceover_text(unit)
+                for unit in chunk_units
+                if demoted_short_original or not unit.get("keep_original_audio")
+            ]
+        )
+        if not narration and audio_mode in {"voiceover", "mixed"}:
+            narration = _join_text([_unit_voiceover_text(unit) for unit in chunk_units])
         if not narration and audio_mode == "voiceover" and not units:
             narration = str(item.get("new_text") or item.get("old_text") or "")
         if audio_mode in {"voiceover", "mixed"} and not narration and not ranges:
             continue
+        future_starts = []
+        for future_chunk in chunks[chunk_index + 1 :]:
+            future_ids = [str(x) for x in future_chunk.get("range_ids") or []]
+            future_start = _min_range_start(_ranges_for_ids(future_ids, by_id))
+            if future_start is not None:
+                future_starts.append(future_start)
+        max_extension_movie_end = min(future_starts) if future_starts else None
         row, cursor = _timeline_item(
             item_index=next_index,
             item=item,
@@ -468,10 +596,17 @@ def _compose_audio_aware_items(
             cursor=cursor,
             source=source,
             movie_shots=movie_shots,
+            reserved_movie_shot_ids=reserved_movie_shot_ids | rendered_movie_shot_ids,
+            max_extension_movie_end=max_extension_movie_end,
             chars_per_second=chars_per_second,
             min_duration=min_duration,
         )
         rows.append(row)
+        rendered_movie_shot_ids.update(_used_movie_shot_ids(row.get("video_clips") or []))
+        for range_row in ranges:
+            range_id = str(range_row.get("range_id") or "")
+            if range_id:
+                consumed_range_ids.add(range_id)
         next_index += 1
     return rows, cursor
 
@@ -485,7 +620,9 @@ def compose_timeline(
     min_duration: float,
 ) -> dict[str, Any]:
     movie_shots = _movie_shot_rows(movie_shots_data)
+    reserved_movie_shot_ids: set[str] = set()
     final_timeline = []
+    rendered_movie_shot_ids: set[str] = set()
     cursor = 0.0
     item_index = 1
     for item in rewritten_script:
@@ -496,6 +633,8 @@ def compose_timeline(
                 cursor=cursor,
                 source=source,
                 movie_shots=movie_shots,
+                reserved_movie_shot_ids=reserved_movie_shot_ids,
+                rendered_movie_shot_ids=rendered_movie_shot_ids,
                 chars_per_second=chars_per_second,
                 min_duration=min_duration,
             )
@@ -506,7 +645,7 @@ def compose_timeline(
         narration = str(item.get("new_text") or item.get("old_text") or "")
         tts_duration = estimate_tts_duration(narration, chars_per_second, min_duration)
         clips, allocation_status = allocate_video_clips(
-            item,
+            {**item, "reserved_movie_shot_ids": sorted(reserved_movie_shot_ids | rendered_movie_shot_ids)},
             tts_duration=tts_duration,
             source=source,
             movie_shots=movie_shots,
@@ -542,6 +681,7 @@ def compose_timeline(
                 "allocation_status": allocation_status,
             }
         )
+        rendered_movie_shot_ids.update(_used_movie_shot_ids(clips))
         cursor = _round(cursor + tts_duration)
         item_index += 1
     return {

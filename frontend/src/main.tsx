@@ -34,10 +34,12 @@ type PipelineConfig = {
   refVideoPath: string;
   moviePath: string;
   subtitlePath: string;
+  movieSubtitlePath: string;
   outputRoot: string;
   asrProvider: "bcut" | "none";
   threshold: number;
   backend: BackendMode;
+  enableAudioRoleClassifier: boolean;
   aiApiKey: string;
   aiBaseUrl: string;
   aiModel: string;
@@ -72,6 +74,20 @@ type Stage = {
   detail: string;
   output: string;
   patterns: string[];
+  optional?: boolean;
+  pipelineName: string;
+};
+
+const pipelineStageMap: Record<string, string> = {
+  reference_analyzer: "reference",
+  narration_segmenter: "segments",
+  movie_shot_parser: "shots",
+  visual_alignment_engine: "alignment",
+  script_visual_binder: "binder",
+  audio_role_classifier: "audio",
+  rewrite_engine: "rewrite",
+  timeline_composer: "timeline",
+  generate_video: "render",
 };
 
 type LogLine = {
@@ -95,6 +111,7 @@ const stages: Stage[] = [
     detail: "提取参考视频字幕、关键帧和节奏信息。",
     output: "outputs/1_reference_analyzer/ref_analysis.json",
     patterns: ["1_reference_analyzer", "ref_analysis.json"],
+    pipelineName: "reference_analyzer",
   },
   {
     id: "segments",
@@ -103,6 +120,7 @@ const stages: Stage[] = [
     detail: "把参考解说拆成可改写、可对齐的语义段。",
     output: "outputs/2_narration_segmenter/narration_segments.json",
     patterns: ["2_narration_segmenter", "narration_segments.json"],
+    pipelineName: "narration_segmenter",
   },
   {
     id: "shots",
@@ -111,6 +129,7 @@ const stages: Stage[] = [
     detail: "识别原片镜头边界，建立素材检索空间。",
     output: "outputs/3_movie_shot_parser/movie_shots.json",
     patterns: ["3_movie_shot_parser", "movie_shots.json"],
+    pipelineName: "movie_shot_parser",
   },
   {
     id: "alignment",
@@ -119,6 +138,7 @@ const stages: Stage[] = [
     detail: "将参考节奏映射到原片镜头时间线。",
     output: "outputs/4_visual_alignment_engine/ref_to_movie_timeline.json",
     patterns: ["4_visual_alignment_engine", "ref_to_movie_timeline.json"],
+    pipelineName: "visual_alignment_engine",
   },
   {
     id: "binder",
@@ -127,30 +147,44 @@ const stages: Stage[] = [
     detail: "为每段解说匹配可使用的原片画面。",
     output: "outputs/5_script_visual_binder/script_mapping.json",
     patterns: ["5_script_visual_binder", "script_mapping.json"],
+    pipelineName: "script_visual_binder",
+  },
+  {
+    id: "audio",
+    step: 6,
+    title: "原声片段识别",
+    detail: "可选。识别哪些片段应保留原片原声。",
+    output: "outputs/5_audio_role_classifier/script_mapping_with_audio.json",
+    patterns: ["5_audio_role_classifier", "script_mapping_with_audio.json"],
+    optional: true,
+    pipelineName: "audio_role_classifier",
   },
   {
     id: "rewrite",
-    step: 6,
+    step: 7,
     title: "AI 仿写",
     detail: "调用 OpenAI 兼容接口生成新解说文案。",
     output: "outputs/6_rewrite_engine/rewritten_script.json",
     patterns: ["6_rewrite_engine", "rewritten_script.json"],
+    pipelineName: "rewrite_engine",
   },
   {
     id: "timeline",
-    step: 7,
+    step: 8,
     title: "时间线合成",
     detail: "生成新视频脚本时间线和剪辑结构。",
     output: "outputs/7_timeline_composer/final_timeline.json",
     patterns: ["7_timeline_composer", "final_timeline.json"],
+    pipelineName: "timeline_composer",
   },
   {
     id: "render",
-    step: 8,
+    step: 9,
     title: "视频与剪映草稿",
     detail: "按渲染模式输出草稿、音频或 mp4 成片。",
     output: "outputs/8_generate_video/generate_video_result.json",
     patterns: ["8_generate_video", "generate_video_result.json", "clone_narration_output.mp4"],
+    pipelineName: "generate_video",
   },
 ];
 
@@ -158,10 +192,12 @@ const defaultConfig: PipelineConfig = {
   refVideoPath: "",
   moviePath: "",
   subtitlePath: "",
+  movieSubtitlePath: "",
   outputRoot: "",
   asrProvider: "bcut",
   threshold: 0.5,
   backend: "auto",
+  enableAudioRoleClassifier: true,
   aiApiKey: "",
   aiBaseUrl: "https://api.openai.com/v1",
   aiModel: "gpt-4o-mini",
@@ -232,13 +268,21 @@ function outputPath(root: string, relative: string) {
   return `${root.replace(/[\\/]$/, "")}\\${relative.replace("outputs/", "").replace(/\//g, "\\")}`;
 }
 
-function isStageEnabled(stage: Stage, renderMode: RenderMode) {
-  return renderMode !== "none" || stage.id !== "render";
+type StageConfig = Pick<PipelineConfig, "renderMode" | "enableAudioRoleClassifier">;
+
+function isStageEnabled(stage: Stage, config: StageConfig) {
+  if (config.renderMode === "none" && stage.id === "render") {
+    return false;
+  }
+  if (!config.enableAudioRoleClassifier && stage.id === "audio") {
+    return false;
+  }
+  return true;
 }
 
-function createStageStates(renderMode: RenderMode) {
+function createStageStates(config: StageConfig) {
   return Object.fromEntries(
-    stages.map((stage) => [stage.id, isStageEnabled(stage, renderMode) ? "waiting" : "skipped"]),
+    stages.map((stage) => [stage.id, isStageEnabled(stage, config) ? "waiting" : "skipped"]),
   ) as Record<string, StageState>;
 }
 
@@ -274,7 +318,7 @@ function App() {
   const [logLines, setLogLines] = useState<LogLine[]>([
     { id: 1, level: "system", text: "工作台已就绪。请选择参考视频和原片后启动流水线。" },
   ]);
-  const [stageStates, setStageStates] = useState<Record<string, StageState>>(() => createStageStates(defaultConfig.renderMode));
+  const [stageStates, setStageStates] = useState<Record<string, StageState>>(() => createStageStates(defaultConfig));
   const [stageProgress, setStageProgress] = useState<Record<string, StageProgress>>({});
   const [aiTest, setAiTest] = useState<{ status: "idle" | "testing" | "ok" | "error"; message: string }>({
     status: "idle",
@@ -303,7 +347,7 @@ function App() {
         setStartedAt(new Date());
         setFinishedCode(null);
         setPipelineLogPath(event.logPath || `${event.outputRoot}\\logs\\pipeline.log`);
-        setStageStates(createStageStates(config.renderMode));
+        setStageStates(createStageStates(config));
         setStageProgress({});
         pushLog("system", `启动命令: ${event.command}`);
         pushLog("system", `输出目录: ${event.outputRoot}`);
@@ -339,7 +383,7 @@ function App() {
             ) as Record<string, StageState>;
           }
           return Object.fromEntries(
-            stages.map((stage) => [stage.id, isStageEnabled(stage, config.renderMode) ? "done" : "skipped"]),
+            stages.map((stage) => [stage.id, isStageEnabled(stage, config) ? "done" : "skipped"]),
           ) as Record<string, StageState>;
         });
         if (event.code === 0) {
@@ -347,7 +391,7 @@ function App() {
             Object.fromEntries(
               stages.map((stage) => [
                 stage.id,
-                previous[stage.id] ?? { percent: isStageEnabled(stage, config.renderMode) ? 100 : 0, message: "" },
+                previous[stage.id] ?? { percent: isStageEnabled(stage, config) ? 100 : 0, message: "" },
               ]),
             ) as Record<string, StageProgress>,
           );
@@ -357,7 +401,7 @@ function App() {
     });
 
     return unsubscribe;
-  }, [config.renderMode]);
+  }, [config.renderMode, config.enableAudioRoleClassifier]);
 
   useEffect(() => {
     if (logRef.current) {
@@ -392,6 +436,23 @@ function App() {
     }, 400);
     return () => clearTimeout(timer);
   }, [config]);
+
+  useEffect(() => {
+    if (isRunning) {
+      return;
+    }
+    setStageStates((previous) => {
+      const next = { ...previous };
+      for (const stage of stages) {
+        if (!isStageEnabled(stage, config)) {
+          next[stage.id] = "skipped";
+        } else if (next[stage.id] === "skipped") {
+          next[stage.id] = "waiting";
+        }
+      }
+      return next;
+    });
+  }, [config.renderMode, config.enableAudioRoleClassifier, isRunning]);
 
   function pushLog(level: LogLine["level"], text: string) {
     const clean = text.trim();
@@ -445,25 +506,33 @@ function App() {
   }
 
   function markStageFromText(text: string) {
-    const marker = text.match(/\[pipeline\]\s+([1-8])_/);
-    const nextIndex = marker ? Number(marker[1]) - 1 : -1;
-    if (nextIndex < 0) {
+    const marker = text.match(/\[pipeline\]\s+\d+_(\w+)\s+(?:->|skipped\s+->)/);
+    if (!marker) {
       return;
     }
+    const stageId = pipelineStageMap[marker[1]];
+    if (!stageId) {
+      return;
+    }
+    const stageIndex = stages.findIndex((stage) => stage.id === stageId);
+    if (stageIndex < 0) {
+      return;
+    }
+    const isSkipped = text.includes(" skipped ");
     setStageStates((previous) => {
       return Object.fromEntries(
         stages.map((stage, index) => {
-          if (!isStageEnabled(stage, config.renderMode)) {
+          if (!isStageEnabled(stage, config)) {
             return [stage.id, "skipped"];
           }
           if (previous[stage.id] === "failed") {
             return [stage.id, "failed"];
           }
-          if (index < nextIndex) {
+          if (index < stageIndex) {
             return [stage.id, "done"];
           }
-          if (index === nextIndex) {
-            return [stage.id, "running"];
+          if (index === stageIndex) {
+            return [stage.id, isSkipped ? "done" : "running"];
           }
           return [stage.id, "waiting"];
         }),
@@ -511,6 +580,13 @@ function App() {
     const selected = await cloneBridge.selectFile({ title: "选择字幕文件", filters: subtitleFilters });
     if (selected) {
       updateConfig("subtitlePath", selected);
+    }
+  }
+
+  async function chooseMovieSubtitle() {
+    const selected = await cloneBridge.selectFile({ title: "选择原片字幕文件", filters: subtitleFilters });
+    if (selected) {
+      updateConfig("movieSubtitlePath", selected);
     }
   }
 
@@ -597,15 +673,15 @@ function App() {
   }
 
   const renderTargets = renderTargetsFromMode(config.renderMode);
-  const activeStageCount = useMemo(() => stages.filter((stage) => isStageEnabled(stage, config.renderMode)).length, [config.renderMode]);
+  const activeStageCount = useMemo(() => stages.filter((stage) => isStageEnabled(stage, config)).length, [config]);
   const completedCount = useMemo(
-    () => stages.filter((stage) => isStageEnabled(stage, config.renderMode) && stageStates[stage.id] === "done").length,
-    [config.renderMode, stageStates],
+    () => stages.filter((stage) => isStageEnabled(stage, config) && stageStates[stage.id] === "done").length,
+    [config, stageStates],
   );
   const progressUnits = useMemo(
     () =>
       stages.reduce((sum, stage) => {
-        if (!isStageEnabled(stage, config.renderMode)) {
+        if (!isStageEnabled(stage, config)) {
           return sum;
         }
         if (stageStates[stage.id] === "done") {
@@ -616,7 +692,7 @@ function App() {
         }
         return sum;
       }, 0),
-    [config.renderMode, stageProgress, stageStates],
+    [config, stageProgress, stageStates],
   );
   const progress = Math.round((progressUnits / activeStageCount) * 100);
   const canStart = config.refVideoPath && config.moviePath && !isRunning;
@@ -754,6 +830,31 @@ function App() {
                   onChoose={chooseSubtitle}
                   onClear={() => updateConfig("subtitlePath", "")}
                 />
+              </div>
+
+              <div className="audio-role-panel">
+                <label className={cx("check-option", config.enableAudioRoleClassifier && "active")}>
+                  <input
+                    type="checkbox"
+                    checked={config.enableAudioRoleClassifier}
+                    onChange={(event) => updateConfig("enableAudioRoleClassifier", event.target.checked)}
+                  />
+                  <span>
+                    <strong>启用原声片段识别</strong>
+                    <small>识别哪些片段应保留原片原声，提升时间线混音准确度</small>
+                  </span>
+                </label>
+                {config.enableAudioRoleClassifier && (
+                  <AssetPicker
+                    icon={<File />}
+                    title="原片字幕"
+                    value={config.movieSubtitlePath}
+                    description="可选。提供 srt 会跳过原片 ASR；未提供时会自动识别。"
+                    actionLabel="选择字幕"
+                    onChoose={chooseMovieSubtitle}
+                    onClear={() => updateConfig("movieSubtitlePath", "")}
+                  />
+                )}
               </div>
             </div>
 

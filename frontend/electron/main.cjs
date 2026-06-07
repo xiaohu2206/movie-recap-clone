@@ -84,10 +84,18 @@ const stageOutputs = [
   ["shots", "3_movie_shot_parser", "movie_shots.json"],
   ["alignment", "4_visual_alignment_engine", "ref_to_movie_timeline.json"],
   ["binder", "5_script_visual_binder", "script_mapping.json"],
+  ["audio", "5_audio_role_classifier", "script_mapping_with_audio.json"],
   ["rewrite", "6_rewrite_engine", "rewritten_script.json"],
   ["timeline", "7_timeline_composer", "final_timeline.json"],
   ["render", "8_generate_video", "generate_video_result.json"],
 ];
+
+function activeStageOutputs(config = {}) {
+  if (config.enableAudioRoleClassifier) {
+    return stageOutputs;
+  }
+  return stageOutputs.filter(([id]) => id !== "audio");
+}
 
 function hasValidJson(filePath) {
   try {
@@ -131,10 +139,12 @@ function configSignature(config = {}) {
     refVideoPath: config.refVideoPath || "",
     moviePath: config.moviePath || "",
     subtitlePath: config.subtitlePath || "",
+    movieSubtitlePath: config.movieSubtitlePath || "",
     outputRoot: config.outputRoot || "",
     asrProvider: config.subtitlePath ? "none" : config.asrProvider,
     threshold: config.threshold,
     backend: config.backend,
+    enableAudioRoleClassifier: !!config.enableAudioRoleClassifier,
     aiProvider: "custom_openai",
     aiBaseUrl: config.aiBaseUrl || "",
     aiModel: config.aiModel || "",
@@ -391,7 +401,7 @@ ipcMain.handle("pipeline:state", async (_event, config = {}) => {
   const root = projectRoot();
   const outputRoot = config.outputRoot || path.join(root, "outputs");
   const logPath = pipelineLogPath(outputRoot);
-  const completedStages = stageOutputs
+  const completedStages = activeStageOutputs(config)
     .filter(([, dir, file]) => hasValidJson(path.join(outputRoot, dir, file)))
     .map(([id]) => id);
   const finalStage = config.renderMode === "none" ? "timeline" : "render";
@@ -497,6 +507,10 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   if (config.subtitlePath) {
     args.push("--subtitle-srt", config.subtitlePath);
   }
+  args.push(config.enableAudioRoleClassifier ? "--enable-audio-role-classifier" : "--no-enable-audio-role-classifier");
+  if (config.movieSubtitlePath) {
+    args.push("--movie-subtitle-srt", config.movieSubtitlePath);
+  }
   if (aiBaseUrl) {
     args.push("--ai-base-url", aiBaseUrl);
   }
@@ -573,7 +587,7 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
     writePipelineMemory(outputRoot, {
       status: code === 0 ? "completed" : "failed",
       exitCode: code,
-      completedStages: stageOutputs
+      completedStages: activeStageOutputs(config)
         .filter(([, dir, file]) => hasValidJson(path.join(outputRoot, dir, file)))
         .map(([id]) => id),
     });

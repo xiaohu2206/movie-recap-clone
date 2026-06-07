@@ -34,6 +34,17 @@ def _subtitle_shots(sub: dict[str, Any], shots: list[dict[str, Any]]) -> list[st
     return ids
 
 
+def _dedupe_boundary_ref_shots(segments: list[dict[str, Any]]) -> None:
+    """相邻段落共享的 ref_shot 只保留在后一段，避免边界镜头被重复绑定。"""
+    for i in range(len(segments) - 1):
+        next_ids = set(segments[i + 1].get("ref_shot_ids") or [])
+        if not next_ids:
+            continue
+        segments[i]["ref_shot_ids"] = [
+            sid for sid in (segments[i].get("ref_shot_ids") or []) if sid not in next_ids
+        ]
+
+
 def segment_narration(
     subtitle_srt: str | Path,
     ref_shots: list[dict[str, Any]],
@@ -78,6 +89,7 @@ def segment_narration(
         current_shots = list(dict.fromkeys([*current_shots, *combined]))
         prev_end = float(sub["end"])
     flush()
+    _dedupe_boundary_ref_shots(segments)
 
     return {"narration_segments": segments, "subtitle_count": len(subtitles), "ref_shot_count": len(ref_shots)}
 

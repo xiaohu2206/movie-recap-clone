@@ -20,7 +20,7 @@ from clone_narration_video.utils.video_tools import export_shot_clips
 # 大写配置-输出分割后的镜头
 EXPORT_SHOT_CLIPS = True          # 默认不开启；开启后输出分割后的镜头视频片段
 SHOT_CLIPS_DIRNAME = "shot_clips"  # 独立文件夹，用于放置分割后的镜头
-SHOT_CLIPS_RATIO = 0.2             # 默认只输出前 20% 的镜头
+SHOT_CLIPS_RATIO = 1             # 默认只输出前 20% 的镜头
 
 
 def parse_movie_shots(

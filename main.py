@@ -205,7 +205,12 @@ def main() -> None:
     parser.add_argument("--ai-base-url", default="")
     parser.add_argument("--ai-model", default="")
     parser.add_argument("--ai-temperature", type=float, default=0.7)
-    parser.add_argument("--enable-audio-role-classifier", action="store_true", help="enable phase-one original-audio role decisions")
+    parser.add_argument(
+        "--enable-audio-role-classifier",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable phase-one original-audio role decisions (default: enabled)",
+    )
     parser.add_argument("--movie-subtitle-srt", help="existing subtitle for original movie; used by audio role classifier")
     parser.add_argument("--chars-per-second", type=float, default=4.2)
     parser.add_argument("--render-mode", choices=["none", "draft", "video", "both"], default="none")

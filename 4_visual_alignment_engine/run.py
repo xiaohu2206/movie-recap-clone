@@ -26,7 +26,7 @@ ALGORITHM_VERSION = "visual_alignment_v3"
 # 大写配置-输出分割后的镜头
 EXPORT_MATCHED_SHOT_CLIPS = True              # 默认不开启；开启后按 ref 镜头建子文件夹输出配对片段
 MATCHED_SHOT_CLIPS_DIRNAME = "matched_shot_clips"  # 独立文件夹；每个 ref 镜头一个子文件夹
-MATCHED_SHOT_CLIPS_RATIO = 0.2                 # 默认只输出前 20% 的镜头
+MATCHED_SHOT_CLIPS_RATIO = 1                 # 默认只输出前 20% 的镜头
 
 def _id(item: dict[str, Any], key: str) -> str:
     return str(item.get(key) or item.get("shot_id") or "")
