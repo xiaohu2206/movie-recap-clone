@@ -13,6 +13,7 @@ add_project_to_syspath()
 
 from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.project_paths import default_output_dir
+from clone_narration_video.utils.shot_breakdown import build_shot_breakdown
 
 
 def _round(value: float) -> float:
@@ -284,6 +285,8 @@ def main() -> None:
     parser.add_argument("--output-dir", default=str(default_output_dir("7_timeline_composer")))
     parser.add_argument("--chars-per-second", type=float, default=4.2)
     parser.add_argument("--min-duration", type=float, default=1.2)
+    parser.add_argument("--ref-analysis", help="可选：第 1 步 ref_analysis.json")
+    parser.add_argument("--output-root", help="可选：outputs 根目录，用于自动查找流水线数据")
     args = parser.parse_args()
 
     rewritten_data = read_json(args.rewritten_script)
@@ -303,6 +306,17 @@ def main() -> None:
     )
     out = write_json(Path(args.output_dir) / "final_timeline.json", result)
     print(out)
+
+    output_root = Path(args.output_root).resolve() if args.output_root else Path(args.output_dir).resolve().parent
+    ref_analysis_data = read_json(args.ref_analysis) if args.ref_analysis else None
+    shot_breakdown = build_shot_breakdown(
+        result.get("final_timeline") or [],
+        ref_analysis=ref_analysis_data,
+        script_mapping=mapping_data,
+        output_root=output_root,
+    )
+    breakdown_out = write_json(Path(args.output_dir) / "shot_breakdown.json", shot_breakdown)
+    print(breakdown_out)
 
 
 if __name__ == "__main__":

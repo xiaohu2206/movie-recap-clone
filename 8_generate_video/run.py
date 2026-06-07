@@ -22,6 +22,7 @@ from clone_narration_video.utils.ffmpeg_utils import probe_duration, ffprobe_jso
 from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir, relpath, resolve_existing_path
+from clone_narration_video.utils.shot_breakdown import build_shot_breakdown
 from clone_narration_video.utils.tts.edge.edge_tts_service import edge_tts_service
 
 
@@ -849,6 +850,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jianying-draft-dir", help="可选：直接输出到剪映草稿根目录")
     parser.add_argument("--video-output-name", default="clone_narration_output.mp4")
     parser.add_argument("--video-encoder", choices=["auto", "libx264", "h264_nvenc"], default=os.getenv("CLONE_VIDEO_ENCODER") or "auto")
+    parser.add_argument("--ref-analysis", help="可选：第 1 步 ref_analysis.json，用于参考视频字幕")
+    parser.add_argument("--script-mapping", help="可选：第 5 步 script_mapping.json，用于原片播放/电影字幕")
+    parser.add_argument("--output-root", help="可选：outputs 根目录，用于自动查找流水线数据")
     return parser
 
 
@@ -902,6 +906,19 @@ async def async_main(args: argparse.Namespace) -> None:
                 message,
             ),
         )
+
+    output_root = Path(args.output_root).resolve() if args.output_root else output_dir.parent
+    ref_analysis_data = read_json(args.ref_analysis) if args.ref_analysis else None
+    script_mapping_data = read_json(args.script_mapping) if args.script_mapping else None
+    shot_breakdown = build_shot_breakdown(
+        items,
+        audio_results=audio_results,
+        ref_analysis=ref_analysis_data,
+        script_mapping=script_mapping_data,
+        output_root=output_root,
+    )
+    shot_breakdown_path = write_json(output_dir / "shot_breakdown.json", shot_breakdown)
+    result["shot_breakdown"] = relpath(shot_breakdown_path)
 
     manifest = write_manifest(output_dir, result)
     emit_progress("render", 100, "Video generation complete")
