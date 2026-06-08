@@ -20,7 +20,7 @@ from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 
 
-USE_LLM_REWRITE = False  # True=大模型生成仿稿；False=直接使用原稿（默认）
+USE_LLM_REWRITE = True  # True=大模型生成仿稿；False=直接使用原稿（默认）
 
 
 SYSTEM_PROMPT = """你是影视解说仿稿助手。

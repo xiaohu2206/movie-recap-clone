@@ -9,8 +9,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "electron": "electron .",
-    "dist": "npm run build && electron-builder --win nsis --x64",
-    "pack:dir": "npm run build && electron-builder --win dir --x64"
+    "dist": "powershell -ExecutionPolicy Bypass -File scripts/prepare-dist.ps1 -Target nsis",
+    "pack:dir": "powershell -ExecutionPolicy Bypass -File scripts/prepare-dist.ps1 -Target dir"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
@@ -48,6 +48,10 @@
       {
         "from": "../requirements.txt",
         "to": "backend/requirements.txt"
+      },
+      {
+        "from": "../__init__.py",
+        "to": "backend/__init__.py"
       },
       {
         "from": "../1_reference_analyzer",
@@ -88,6 +92,16 @@
       {
         "from": "../model",
         "to": "backend/model"
+      },
+      {
+        "from": "../.venv",
+        "to": "backend/.venv",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/*.pyo"
+        ]
       }
     ],
     "win": {

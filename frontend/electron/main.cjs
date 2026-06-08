@@ -37,10 +37,17 @@ function rendererUrl() {
   return "http://127.0.0.1:5173";
 }
 
+function bundledPython(root) {
+  return path.join(root, ".venv", "Scripts", "python.exe");
+}
+
 function candidatePython(root) {
-  const localPython = path.join(root, ".venv", "Scripts", "python.exe");
+  const localPython = bundledPython(root);
   if (fs.existsSync(localPython)) {
     return localPython;
+  }
+  if (app.isPackaged) {
+    logMain(`bundled venv missing: ${localPython}`);
   }
   return process.platform === "win32" ? "python" : "python3";
 }
@@ -449,6 +456,13 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   const mainScript = path.join(root, "main.py");
   if (!fs.existsSync(mainScript)) {
     return { ok: false, error: `找不到后端入口: ${mainScript}` };
+  }
+  if (app.isPackaged && !fs.existsSync(bundledPython(root))) {
+    return {
+      ok: false,
+      error:
+        "安装包未包含 Python 运行环境（backend/.venv）。请使用 cnpm run dist 重新打包完整安装包。",
+    };
   }
 
   const outputRoot = config.outputRoot || path.join(root, "outputs");
