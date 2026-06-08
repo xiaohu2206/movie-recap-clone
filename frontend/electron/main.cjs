@@ -38,18 +38,52 @@ function rendererUrl() {
 }
 
 function bundledPython(root) {
-  return path.join(root, ".venv", "Scripts", "python.exe");
+  const portablePython = path.join(root, "python", "python.exe");
+  if (fs.existsSync(portablePython)) {
+    return portablePython;
+  }
+  const venvPython = path.join(root, ".venv", "Scripts", "python.exe");
+  if (fs.existsSync(venvPython)) {
+    return venvPython;
+  }
+  return "";
+}
+
+function hasBundledPython(root) {
+  return Boolean(bundledPython(root));
 }
 
 function candidatePython(root) {
-  const localPython = bundledPython(root);
-  if (fs.existsSync(localPython)) {
-    return localPython;
+  const resolved = bundledPython(root);
+  if (resolved) {
+    return resolved;
   }
   if (app.isPackaged) {
-    logMain(`bundled venv missing: ${localPython}`);
+    logMain("bundled python missing under backend/python or backend/.venv");
   }
   return process.platform === "win32" ? "python" : "python3";
+}
+
+function sanitizeStoredPath(value) {
+  if (!value || typeof value !== "string") {
+    return "";
+  }
+  let fixed = value.replace(/\r/g, "");
+  fixed = fixed.replace(/([A-Za-z]:)esources/g, "$1\\resources");
+  return path.normalize(fixed);
+}
+
+function sanitizePipelineConfig(config = {}) {
+  const next = { ...config };
+  for (const key of ["refVideoPath", "moviePath", "subtitlePath", "outputRoot", "jianyingDraftDir"]) {
+    if (typeof next[key] === "string" && next[key]) {
+      next[key] = sanitizeStoredPath(next[key]);
+    }
+  }
+  if (!next.outputRoot) {
+    next.outputRoot = path.join(projectRoot(), "outputs");
+  }
+  return next;
 }
 
 function jianyingDraftCandidates() {
@@ -315,7 +349,8 @@ function normalizeChatUrl(baseUrl) {
 
 ipcMain.handle("config:load", async () => {
   try {
-    return JSON.parse(fs.readFileSync(userConfigPath(), "utf8"));
+    const config = JSON.parse(fs.readFileSync(userConfigPath(), "utf8"));
+    return sanitizePipelineConfig(config);
   } catch {
     return null;
   }
@@ -323,7 +358,7 @@ ipcMain.handle("config:load", async () => {
 
 ipcMain.handle("config:save", async (_event, config = {}) => {
   try {
-    fs.writeFileSync(userConfigPath(), JSON.stringify(config, null, 2), "utf8");
+    fs.writeFileSync(userConfigPath(), JSON.stringify(sanitizePipelineConfig(config), null, 2), "utf8");
     return { ok: true };
   } catch (error) {
     logMain(`config:save failed: ${error.message}`);
@@ -388,23 +423,26 @@ ipcMain.handle("backend:info", async () => {
   const root = projectRoot();
   return {
     root,
+    defaultOutputRoot: path.join(root, "outputs"),
     python: candidatePython(root),
     packaged: app.isPackaged,
+    hasBundledPython: fs.existsSync(path.join(root, "python", "python.exe")),
     hasLocalVenv: fs.existsSync(path.join(root, ".venv", "Scripts", "python.exe")),
   };
 });
 
 ipcMain.handle("pipeline:state", async (_event, config = {}) => {
   const root = projectRoot();
-  const outputRoot = config.outputRoot || path.join(root, "outputs");
+  const normalized = sanitizePipelineConfig(config);
+  const outputRoot = normalized.outputRoot || path.join(root, "outputs");
   const logPath = pipelineLogPath(outputRoot);
   const completedStages = stageOutputs
     .filter(([, dir, file]) => hasValidJson(path.join(outputRoot, dir, file)))
     .map(([id]) => id);
-  const finalStage = config.renderMode === "none" ? "timeline" : "render";
-  const finalOutputComplete = completedStages.includes(finalStage) && hasCompletedFinalOutput(outputRoot, config.renderMode);
+  const finalStage = normalized.renderMode === "none" ? "timeline" : "render";
+  const finalOutputComplete = completedStages.includes(finalStage) && hasCompletedFinalOutput(outputRoot, normalized.renderMode);
   const memory = readPipelineMemory(outputRoot);
-  const sameProject = !memory?.configSignature || memory.configSignature === configSignature({ ...config, outputRoot });
+  const sameProject = !memory?.configSignature || memory.configSignature === configSignature({ ...normalized, outputRoot });
   const completed = finalOutputComplete && (!memory || memory.status === "completed");
 
   return {
@@ -447,21 +485,22 @@ ipcMain.handle("pipeline:stop", async () => {
   return { ok: true };
 });
 
-ipcMain.handle("pipeline:start", async (_event, config) => {
+ipcMain.handle("pipeline:start", async (_event, rawConfig) => {
   if (activeProcess) {
     return { ok: false, error: "已有任务正在运行" };
   }
 
+  const config = sanitizePipelineConfig(rawConfig);
   const root = projectRoot();
   const mainScript = path.join(root, "main.py");
   if (!fs.existsSync(mainScript)) {
     return { ok: false, error: `找不到后端入口: ${mainScript}` };
   }
-  if (app.isPackaged && !fs.existsSync(bundledPython(root))) {
+  if (app.isPackaged && !hasBundledPython(root)) {
     return {
       ok: false,
       error:
-        "安装包未包含 Python 运行环境（backend/.venv）。请使用 cnpm run dist 重新打包完整安装包。",
+        "安装包未包含 Python 运行环境（backend/python）。请重新执行 cnpm run pack:dir 打包完整安装包。",
     };
   }
 
