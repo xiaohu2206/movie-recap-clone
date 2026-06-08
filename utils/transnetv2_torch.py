@@ -369,9 +369,15 @@ def _cuda_usable() -> bool:
         return False
 
 
+def _error_summary(error: BaseException) -> str:
+    message = str(error).strip() or error.__class__.__name__
+    return message[:500]
+
+
 class TransNetV2Torch:
     def __init__(self, model_dir: str, device: Optional[str] = None):
         self._device = self._resolve_device(device)
+        self._device_fallback_reason: Optional[str] = None
         self._lock = threading.Lock()
         self._model = _TransNetV2Net()
 
@@ -388,7 +394,7 @@ class TransNetV2Torch:
             state = state["state_dict"]
         self._model.load_state_dict(state)
         self._model.eval()
-        self._model.to(self._device)
+        self._move_model_to_device(self._device)
 
     def _resolve_device(self, device: Optional[str]) -> torch.device:
         raw = str(device or os.environ.get("TRANSNETV2_DEVICE") or "auto").strip().lower()
@@ -401,8 +407,27 @@ class TransNetV2Torch:
         except Exception:
             return torch.device("cuda") if _cuda_usable() else torch.device("cpu")
 
+    def _move_model_to_device(self, device: torch.device) -> None:
+        try:
+            self._model.to(device)
+        except Exception as exc:
+            if device.type != "cuda":
+                raise
+            self._fallback_to_cpu(exc)
+
+    def _fallback_to_cpu(self, error: BaseException) -> None:
+        reason = _error_summary(error)
+        logger.warning("[TransNetV2] CUDA failed; falling back to CPU: %s", reason)
+        self._device = torch.device("cpu")
+        self._device_fallback_reason = reason
+        self._model.to(self._device)
+
     def get_backend_info(self) -> dict:
-        return {"backend": "torch", "device": str(self._device)}
+        info = {"backend": "torch", "device": str(self._device)}
+        if self._device_fallback_reason:
+            info["device_fallback"] = "cpu"
+            info["device_fallback_reason"] = self._device_fallback_reason
+        return info
 
     def predict_raw(self, frames: np.ndarray):
         if not isinstance(frames, np.ndarray):
@@ -412,6 +437,15 @@ class TransNetV2Torch:
         if len(frames.shape) != 5 or list(frames.shape[2:]) != [27, 48, 3]:
             raise ValueError("frames shape must be [B, T, 27, 48, 3]")
 
+        try:
+            return self._predict_raw_on_current_device(frames)
+        except Exception as exc:
+            if self._device.type != "cuda":
+                raise
+            self._fallback_to_cpu(exc)
+            return self._predict_raw_on_current_device(frames)
+
+    def _predict_raw_on_current_device(self, frames: np.ndarray):
         x = torch.from_numpy(frames)
         if not x.is_contiguous():
             x = x.contiguous()

@@ -199,8 +199,12 @@ def detect_shots(
     backend_info: dict[str, Any]
     if backend == "opencv":
         scenes, frame_count, backend_info = _detect_with_frame_diff(video_path, threshold, progress_callback)
-    else:
+        backend_info["requested_backend"] = "opencv"
+    elif backend in {"auto", "transnet"}:
         scenes, frame_count, backend_info = _detect_with_transnet(video_path, threshold, progress_callback)
+        backend_info["requested_backend"] = backend
+    else:
+        raise ValueError(f"Unsupported shot detection backend: {backend}")
 
     min_frames = max(2, int(round(fps * 0.15)))
     scenes = _normalize_scenes(np.array(scenes, dtype=np.int32), frame_count, min_frames)
