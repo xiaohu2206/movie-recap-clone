@@ -53,6 +53,25 @@ def _char_len(text: str) -> int:
     return len(re.sub(r"\s+", "", text or ""))
 
 
+def _narration_old_text(item: dict[str, Any]) -> str:
+    narration_part = item.get("narration_part") or {}
+    if isinstance(narration_part, dict):
+        text = str(narration_part.get("old_text") or "").strip()
+        if text:
+            return text
+    return str(item.get("old_text") or item.get("text") or "")
+
+
+def _audio_fields(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "audio_pattern": item.get("audio_pattern") or "all_narration",
+        "split_clip_index": item.get("split_clip_index"),
+        "narration_part": item.get("narration_part") or {},
+        "original_audio_part": item.get("original_audio_part") or {},
+        "movie_time_ranges": item.get("movie_time_ranges") or [],
+    }
+
+
 def _build_batch_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     rewrite_input = []
     for item in items:
@@ -60,7 +79,7 @@ def _build_batch_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
         rewrite_input.append(
             {
                 "segment_id": item.get("segment_id"),
-                "old_text": item.get("old_text") or item.get("text") or "",
+                "old_text": _narration_old_text(item),
                 "text_role": item.get("text_role") or "narration",
                 "ref_time_range": item.get("ref_time_range") or {},
                 "movie_time_ranges": [
@@ -128,19 +147,21 @@ def pass_through_original_script(
     total = len(script_mapping)
     for idx, item in enumerate(script_mapping, start=1):
         seg_id = str(item.get("segment_id") or "")
-        old_text = str(item.get("old_text") or item.get("text") or "")
+        audio_pattern = str(item.get("audio_pattern") or "all_narration")
+        old_text = _narration_old_text(item)
+        new_text = "" if audio_pattern == "all_original_audio" else old_text
         role = str(item.get("text_role") or "narration")
         rewritten.append(
             {
                 "segment_id": seg_id,
                 "old_text": old_text,
-                "new_text": old_text,
+                "new_text": new_text,
                 "old_char_count": _char_len(old_text),
-                "new_char_count": _char_len(old_text),
+                "new_char_count": _char_len(new_text),
                 "text_role": role,
                 "ref_time_range": item.get("ref_time_range") or {},
-                "movie_time_ranges": item.get("movie_time_ranges") or [],
-                "rewrite_status": "original",
+                **_audio_fields(item),
+                "rewrite_status": "original_audio_skip" if audio_pattern == "all_original_audio" else "original",
             }
         )
         if progress_callback:
@@ -171,7 +192,8 @@ async def rewrite_script(
     api_key = (api_key or "").strip()
     base_url = (base_url or "").strip()
     model = (model or "").strip()
-    if not api_key:
+    llm_items = [item for item in script_mapping if str(item.get("audio_pattern") or "all_narration") != "all_original_audio"]
+    if llm_items and not api_key:
         raise ValueError("缺少 AI API Key")
 
     cfg = AIModelConfig(
@@ -186,36 +208,60 @@ async def rewrite_script(
     rewritten: list[dict[str, Any]] = []
 
     try:
-        total = len(script_mapping)
-        for start in range(0, len(script_mapping), max(1, batch_size)):
-            batch = script_mapping[start : start + max(1, batch_size)]
+        skipped = {
+            str(item.get("segment_id") or ""): item
+            for item in script_mapping
+            if str(item.get("audio_pattern") or "all_narration") == "all_original_audio"
+        }
+        rewritten_by_id: dict[str, dict[str, Any]] = {}
+
+        for seg_id, item in skipped.items():
+            old_text = _narration_old_text(item)
+            rewritten_by_id[seg_id] = {
+                "segment_id": seg_id,
+                "old_text": old_text,
+                "new_text": "",
+                "old_char_count": _char_len(old_text),
+                "new_char_count": 0,
+                "text_role": str(item.get("text_role") or "narration"),
+                "ref_time_range": item.get("ref_time_range") or {},
+                **_audio_fields(item),
+                "rewrite_status": "original_audio_skip",
+            }
+
+        total = len(llm_items)
+        for start in range(0, len(llm_items), max(1, batch_size)):
+            batch = llm_items[start : start + max(1, batch_size)]
             if progress_callback:
                 progress_callback((start / max(1, total)) * 100.0, f"Rewriting batch {start + 1}-{start + len(batch)} of {total}")
             ai_rows = await _call_ai_batch(provider, batch)
 
             for item in batch:
                 seg_id = str(item.get("segment_id") or "")
-                old_text = str(item.get("old_text") or "")
+                old_text = _narration_old_text(item)
                 role = str(item.get("text_role") or "narration")
                 new_text = ai_rows.get(seg_id)
                 if not new_text:
                     raise ValueError(f"AI 返回缺少 segment_id={seg_id} 的 new_text")
-                rewritten.append(
-                    {
-                        "segment_id": seg_id,
-                        "old_text": old_text,
-                        "new_text": new_text,
-                        "old_char_count": _char_len(old_text),
-                        "new_char_count": _char_len(new_text),
-                        "text_role": role,
-                        "ref_time_range": item.get("ref_time_range") or {},
-                        "movie_time_ranges": item.get("movie_time_ranges") or [],
-                        "rewrite_status": "ai_rewritten",
-                    }
-                )
+                rewritten_by_id[seg_id] = {
+                    "segment_id": seg_id,
+                    "old_text": old_text,
+                    "new_text": new_text,
+                    "old_char_count": _char_len(old_text),
+                    "new_char_count": _char_len(new_text),
+                    "text_role": role,
+                    "ref_time_range": item.get("ref_time_range") or {},
+                    **_audio_fields(item),
+                    "rewrite_status": "ai_rewritten",
+                }
             if progress_callback:
                 done = min(total, start + len(batch))
                 progress_callback((done / max(1, total)) * 100.0, f"Rewritten segments {done}/{total}")
+
+        for item in script_mapping:
+            seg_id = str(item.get("segment_id") or "")
+            if seg_id in rewritten_by_id:
+                rewritten.append(rewritten_by_id[seg_id])
     finally:
         await provider.close()
 

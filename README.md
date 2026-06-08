@@ -1,12 +1,14 @@
 # clone_narration_video
 
-这是独立的影视解说克隆子项目。当前已实现八个模块：
+这是独立的影视解说克隆子项目。当前已实现十个流水线步骤：
 
 1. `1_reference_analyzer` 参考视频解析
 2. `2_narration_segmenter` 解说段落切分
 3. `3_movie_shot_parser` 原电影镜头拆分
 4. `4_visual_alignment_engine` 画面定位
 5. `5_script_visual_binder` 解说画面绑定
+5.1. `5.1_movie_subtitle_filler` 原片字幕补充
+5.2. `5.2_audio_role_classifier` 原声判定
 6. `6_rewrite_engine` 仿稿
 7. `7_timeline_composer` 生成新视频脚本时间轴
 8. `8_generate_video` 生成剪映草稿 / 直接生成视频
@@ -79,6 +81,7 @@ python .\main.py `
   --ref-video-path .\data\ref.mp4 `
   --movie-path .\data\movie.mp4 `
   --subtitle-srt .\data\ref.srt `
+  --movie-subtitle-srt .\data\movie.srt `
   --ai-provider custom_openai `
   --render-mode both
 ```
@@ -222,13 +225,56 @@ python .\5_script_visual_binder\run.py `
 outputs\5_script_visual_binder\script_mapping.json
 ```
 
+### 5.1 原片字幕补充
+
+有现成原片字幕时推荐这样跑，速度最快：
+
+```powershell
+python .\5.1_movie_subtitle_filler\run.py `
+  --script-mapping .\outputs\5_script_visual_binder\script_mapping.json `
+  --movie-path .\data\movie.mp4 `
+  --movie-subtitle-srt .\data\movie.srt `
+  --output-dir .\outputs\5.1_movie_subtitle_filler
+```
+
+没有原片字幕、需要自动识别时：
+
+```powershell
+python .\5.1_movie_subtitle_filler\run.py `
+  --script-mapping .\outputs\5_script_visual_binder\script_mapping.json `
+  --movie-path .\data\movie.mp4 `
+  --output-dir .\outputs\5.1_movie_subtitle_filler
+```
+
+输出：
+
+```text
+outputs\5.1_movie_subtitle_filler\script_mapping_subtitled.json
+outputs\5.1_movie_subtitle_filler\movie_subtitle.srt
+```
+
+### 5.2 原声判定
+
+```powershell
+python .\5.2_audio_role_classifier\run.py `
+  --script-mapping .\outputs\5.1_movie_subtitle_filler\script_mapping_subtitled.json `
+  --output-dir .\outputs\5.2_audio_role_classifier `
+  --provider custom_openai
+```
+
+输出：
+
+```text
+outputs\5.2_audio_role_classifier\script_mapping_with_audio.json
+```
+
 ### 6. 仿稿
 
 使用 AI：
 
 ```powershell
 python .\6_rewrite_engine\run.py `
-  --script-mapping .\outputs\5_script_visual_binder\script_mapping.json `
+  --script-mapping .\outputs\5.2_audio_role_classifier\script_mapping_with_audio.json `
   --output-dir .\outputs\6_rewrite_engine `
   --provider custom_openai
 ```
@@ -244,25 +290,28 @@ outputs\6_rewrite_engine\rewritten_script.json
 ```powershell
 python .\7_timeline_composer\run.py `
   --rewritten-script .\outputs\6_rewrite_engine\rewritten_script.json `
-  --script-mapping .\outputs\5_script_visual_binder\script_mapping.json `
+  --script-mapping .\outputs\5.2_audio_role_classifier\script_mapping_with_audio.json `
   --movie-shots .\outputs\3_movie_shot_parser\movie_shots.json `
   --movie-source .\data\movie.mp4 `
-  --output-dir .\outputs\7_timeline_composer
+  --output-dir .\outputs\7_timeline_composer `
+  --output-root .\outputs
 ```
 
 输出：
 
 ```text
 outputs\7_timeline_composer\final_timeline.json
+outputs\7_timeline_composer\shot_breakdown.json
 ```
 
-## 七模块流水线 / 可选第 8 步渲染
+## 完整流水线 / 可选第 8 步渲染
 
 ```powershell
 python .\main.py `
   --ref-video-path .\data\ref.mp4 `
   --movie-path .\data\movie.mp4 `
   --subtitle-srt .\data\ref.srt `
+  --movie-subtitle-srt .\data\movie.srt `
   --ai-provider custom_openai
 ```
 
@@ -275,6 +324,8 @@ python .\main.py `
 python .\8_generate_video\run.py `
   --timeline .\outputs\7_timeline_composer\final_timeline.json `
   --output-dir .\outputs\8_generate_video `
+  --script-mapping .\outputs\5.2_audio_role_classifier\script_mapping_with_audio.json `
+  --output-root .\outputs `
   --mode both `
   --voice-id zh-CN-XiaoxiaoNeural
 ```
@@ -284,6 +335,8 @@ python .\8_generate_video\run.py `
 python .\8_generate_video\run.py `
   --timeline .\outputs\7_timeline_composer\final_timeline.json `
   --output-dir .\outputs\8_generate_video `
+  --script-mapping .\outputs\5.2_audio_role_classifier\script_mapping_with_audio.json `
+  --output-root .\outputs `
   --mode draft `
   --voice-id zh-CN-XiaoxiaoNeural
 ```
@@ -293,6 +346,8 @@ python .\8_generate_video\run.py `
 python .\8_generate_video\run.py `
   --timeline .\outputs\7_timeline_composer\final_timeline.json `
   --output-dir .\outputs\8_generate_video `
+  --script-mapping .\outputs\5.2_audio_role_classifier\script_mapping_with_audio.json `
+  --output-root .\outputs `
   --mode video `
   --voice-id zh-CN-XiaoxiaoNeural `
   --video-output-name clone_narration_output.mp4 `
@@ -313,6 +368,7 @@ python .\main.py `
   --ref-video-path .\data\ref.mp4 `
   --movie-path .\data\movie.mp4 `
   --subtitle-srt .\data\ref.srt `
+  --movie-subtitle-srt .\data\movie.srt `
   --ai-provider custom_openai `
   --render-mode both `
   --edge-voice-id zh-CN-XiaoxiaoNeural `

@@ -78,6 +78,41 @@ def _base_ranges(item: dict[str, Any]) -> list[dict[str, Any]]:
     return ranges
 
 
+def _clip_index(row: dict[str, Any], fallback: int) -> int:
+    try:
+        return int(row.get("clip_index"))
+    except Exception:
+        return fallback
+
+
+def _ranges_for_indexes(item: dict[str, Any], indexes: set[int]) -> list[dict[str, Any]]:
+    selected = []
+    for fallback, row in enumerate(item.get("movie_time_ranges") or []):
+        if _clip_index(row, fallback) in indexes:
+            selected.append(row)
+    return selected
+
+
+def _range_duration(rows: list[dict[str, Any]]) -> float:
+    return _round(sum(_duration(row.get("start"), row.get("end")) for row in rows))
+
+
+def _subtitle_texts(rows: list[dict[str, Any]]) -> list[str]:
+    texts: list[str] = []
+    for row in rows:
+        for sub in row.get("movie_subtitles") or []:
+            text = str(sub.get("text") if isinstance(sub, dict) else sub or "").strip()
+            if text:
+                texts.append(text)
+    return texts
+
+
+def _sub_item(item: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    clone = dict(item)
+    clone["movie_time_ranges"] = rows
+    return clone
+
+
 def _used_movie_shot_ids(ranges: list[dict[str, Any]]) -> set[str]:
     used: set[str] = set()
     for row in ranges:
@@ -209,25 +244,28 @@ def compose_timeline(
     movie_shots = _movie_shot_rows(movie_shots_data)
     final_timeline = []
     cursor = 0.0
-    for idx, item in enumerate(rewritten_script, start=1):
-        narration = str(item.get("new_text") or item.get("old_text") or "")
+
+    def append_narration_item(base_item: dict[str, Any], idx: int, suffix: str, narration: str) -> None:
+        nonlocal cursor
         tts_duration = estimate_tts_duration(narration, chars_per_second, min_duration)
         clips, allocation_status = allocate_video_clips(
-            item,
+            base_item,
             tts_duration=tts_duration,
             source=source,
             movie_shots=movie_shots,
         )
-        ref_range = item.get("ref_time_range") or {}
+        ref_range = base_item.get("ref_time_range") or {}
         ref_shot_ids = [
             str(row.get("source_ref_shot_id"))
-            for row in item.get("movie_time_ranges") or []
+            for row in base_item.get("movie_time_ranges") or []
             if row.get("source_ref_shot_id")
         ]
+        item_id = f"item_{idx:03d}{suffix}"
         final_timeline.append(
             {
-                "item_id": f"item_{idx:03d}",
-                "segment_id": item.get("segment_id"),
+                "item_id": item_id,
+                "segment_id": base_item.get("segment_id"),
+                "audio_type": "narration",
                 "narration": narration,
                 "tts_duration": tts_duration,
                 "timeline_start": _round(cursor),
@@ -238,11 +276,82 @@ def compose_timeline(
                     "ref_end": ref_range.get("end"),
                     "ref_shot_ids": ref_shot_ids,
                 },
-                "confidence": _confidence(item, clips, allocation_status),
+                "confidence": _confidence(base_item, clips, allocation_status),
                 "allocation_status": allocation_status,
+                "audio_pattern": base_item.get("audio_pattern") or "all_narration",
             }
         )
         cursor = _round(cursor + tts_duration)
+
+    def append_original_item(base_item: dict[str, Any], idx: int, suffix: str, rows: list[dict[str, Any]]) -> None:
+        nonlocal cursor
+        duration = max(_range_duration(rows), min_duration)
+        clips = []
+        for clip_idx, row in enumerate(rows, start=1):
+            clip = _clip(
+                clip_idx,
+                float(row.get("start") or 0.0),
+                float(row.get("end") or 0.0),
+                source,
+                source_ref_shot_id=row.get("source_ref_shot_id"),
+                movie_shot_ids=[str(x) for x in row.get("movie_shot_ids") or []],
+                allocation="original",
+            )
+            clip["keep_original_audio"] = True
+            clips.append(clip)
+        ref_range = base_item.get("ref_time_range") or {}
+        final_timeline.append(
+            {
+                "item_id": f"item_{idx:03d}{suffix}",
+                "segment_id": base_item.get("segment_id"),
+                "audio_type": "original_audio",
+                "keep_original_audio": True,
+                "narration": "",
+                "tts_duration": duration,
+                "timeline_start": _round(cursor),
+                "timeline_end": _round(cursor + duration),
+                "video_clips": clips,
+                "original_subtitles": _subtitle_texts(rows),
+                "ref_source": {
+                    "ref_start": ref_range.get("start"),
+                    "ref_end": ref_range.get("end"),
+                    "ref_shot_ids": [str(row.get("source_ref_shot_id")) for row in rows if row.get("source_ref_shot_id")],
+                },
+                "confidence": "medium" if clips else "low",
+                "allocation_status": "kept_original_audio" if clips else "missing_visual_ranges",
+                "audio_pattern": base_item.get("audio_pattern") or "all_original_audio",
+            }
+        )
+        cursor = _round(cursor + duration)
+
+    for idx, item in enumerate(rewritten_script, start=1):
+        pattern = str(item.get("audio_pattern") or "all_narration")
+        narration = str(item.get("new_text") or item.get("old_text") or "")
+        narration_part = item.get("narration_part") or {}
+        original_part = item.get("original_audio_part") or {}
+        narration_indexes = {int(x) for x in narration_part.get("clip_indexes") or []}
+        original_indexes = {int(x) for x in original_part.get("clip_indexes") or []}
+        if pattern == "all_original_audio":
+            rows = _base_ranges(item)
+            append_original_item(item, idx, "_original", rows)
+            continue
+        if pattern == "narration_then_original_audio":
+            narration_rows = _ranges_for_indexes(item, narration_indexes)
+            original_rows = _ranges_for_indexes(item, original_indexes)
+            if narration_rows:
+                append_narration_item(_sub_item(item, narration_rows), idx, "_narration", narration)
+            if original_rows:
+                append_original_item(_sub_item(item, original_rows), idx, "_original", original_rows)
+            continue
+        if pattern == "original_audio_then_narration":
+            original_rows = _ranges_for_indexes(item, original_indexes)
+            narration_rows = _ranges_for_indexes(item, narration_indexes)
+            if original_rows:
+                append_original_item(_sub_item(item, original_rows), idx, "_original", original_rows)
+            if narration_rows:
+                append_narration_item(_sub_item(item, narration_rows), idx, "_narration", narration)
+            continue
+        append_narration_item(item, idx, "", narration)
     return {
         "final_timeline": final_timeline,
         "timeline_backend": {

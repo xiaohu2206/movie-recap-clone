@@ -34,6 +34,7 @@ type PipelineConfig = {
   refVideoPath: string;
   moviePath: string;
   subtitlePath: string;
+  movieSubtitlePath: string;
   outputRoot: string;
   asrProvider: "bcut" | "none";
   threshold: number;
@@ -129,6 +130,22 @@ const stages: Stage[] = [
     patterns: ["5_script_visual_binder", "script_mapping.json"],
   },
   {
+    id: "subtitle",
+    step: 5.1,
+    title: "原片字幕补充",
+    detail: "为绑定画面补充原片台词字幕。",
+    output: "outputs/5.1_movie_subtitle_filler/script_mapping_subtitled.json",
+    patterns: ["5.1_movie_subtitle_filler", "script_mapping_subtitled.json"],
+  },
+  {
+    id: "audio_role",
+    step: 5.2,
+    title: "原声判定",
+    detail: "判断每段使用 AI 配音还是保留原片原声。",
+    output: "outputs/5.2_audio_role_classifier/script_mapping_with_audio.json",
+    patterns: ["5.2_audio_role_classifier", "script_mapping_with_audio.json"],
+  },
+  {
     id: "rewrite",
     step: 6,
     title: "AI 仿写",
@@ -158,6 +175,7 @@ const defaultConfig: PipelineConfig = {
   refVideoPath: "",
   moviePath: "",
   subtitlePath: "",
+  movieSubtitlePath: "",
   outputRoot: "",
   asrProvider: "bcut",
   threshold: 0.5,
@@ -445,8 +463,9 @@ function App() {
   }
 
   function markStageFromText(text: string) {
-    const marker = text.match(/\[pipeline\]\s+([1-8])_/);
-    const nextIndex = marker ? Number(marker[1]) - 1 : -1;
+    const marker = text.match(/\[pipeline\]\s+([0-9]+(?:\.[0-9]+)?)_/);
+    const step = marker ? Number(marker[1]) : NaN;
+    const nextIndex = Number.isFinite(step) ? stages.findIndex((stage) => stage.step === step) : -1;
     if (nextIndex < 0) {
       return;
     }
@@ -507,10 +526,10 @@ function App() {
     }
   }
 
-  async function chooseSubtitle() {
-    const selected = await cloneBridge.selectFile({ title: "选择字幕文件", filters: subtitleFilters });
+  async function chooseSubtitle(key: "subtitlePath" | "movieSubtitlePath", title = "选择字幕文件") {
+    const selected = await cloneBridge.selectFile({ title, filters: subtitleFilters });
     if (selected) {
-      updateConfig("subtitlePath", selected);
+      updateConfig(key, selected);
     }
   }
 
@@ -751,8 +770,17 @@ function App() {
                   value={config.subtitlePath}
                   description="可选。提供 srt 会跳过 ASR，速度更快。"
                   actionLabel="选择字幕"
-                  onChoose={chooseSubtitle}
+                  onChoose={() => chooseSubtitle("subtitlePath", "选择参考字幕")}
                   onClear={() => updateConfig("subtitlePath", "")}
+                />
+                <AssetPicker
+                  icon={<File />}
+                  title="原片字幕"
+                  value={config.movieSubtitlePath}
+                  description="可选。提供 srt 可跳过原片 ASR，并用于原声判定。"
+                  actionLabel="选择字幕"
+                  onChoose={() => chooseSubtitle("movieSubtitlePath", "选择原片字幕")}
+                  onClear={() => updateConfig("movieSubtitlePath", "")}
                 />
               </div>
             </div>

@@ -91,6 +91,8 @@ const stageOutputs = [
   ["shots", "3_movie_shot_parser", "movie_shots.json"],
   ["alignment", "4_visual_alignment_engine", "ref_to_movie_timeline.json"],
   ["binder", "5_script_visual_binder", "script_mapping.json"],
+  ["subtitle", "5.1_movie_subtitle_filler", "script_mapping_subtitled.json"],
+  ["audio_role", "5.2_audio_role_classifier", "script_mapping_with_audio.json"],
   ["rewrite", "6_rewrite_engine", "rewritten_script.json"],
   ["timeline", "7_timeline_composer", "final_timeline.json"],
   ["render", "8_generate_video", "generate_video_result.json"],
@@ -138,6 +140,7 @@ function configSignature(config = {}) {
     refVideoPath: config.refVideoPath || "",
     moviePath: config.moviePath || "",
     subtitlePath: config.subtitlePath || "",
+    movieSubtitlePath: config.movieSubtitlePath || "",
     outputRoot: config.outputRoot || "",
     asrProvider: config.subtitlePath ? "none" : config.asrProvider,
     threshold: config.threshold,
@@ -510,6 +513,9 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
 
   if (config.subtitlePath) {
     args.push("--subtitle-srt", config.subtitlePath);
+  }
+  if (config.movieSubtitlePath) {
+    args.push("--movie-subtitle-srt", config.movieSubtitlePath);
   }
   if (aiBaseUrl) {
     args.push("--ai-base-url", aiBaseUrl);

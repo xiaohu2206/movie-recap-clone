@@ -229,7 +229,7 @@ def resolve_pipeline_context(
     if script_mapping is None and mapping_path:
         script_mapping = read_json(mapping_path)
     if script_mapping is None:
-        alt_mapping = _pick(script_mapping_path, "5_audio_role_classifier", "script_mapping_with_audio.json")
+        alt_mapping = _pick(script_mapping_path, "5.2_audio_role_classifier", "script_mapping_with_audio.json")
         if alt_mapping:
             script_mapping = read_json(alt_mapping)
 
@@ -239,7 +239,7 @@ def resolve_pipeline_context(
     if not ref_srt_path:
         ref_srt_path = _pick(None, "1_reference_analyzer", "ref_subtitle.srt")
 
-    movie_srt_path = movie_subtitle_path or _pick(None, "5_audio_role_classifier", "movie_subtitle.srt")
+    movie_srt_path = movie_subtitle_path or _pick(None, "5.1_movie_subtitle_filler", "movie_subtitle.srt")
     if not movie_srt_path:
         movie_srt_path = _pick(None, "3_movie_shot_parser", "movie_subtitle.srt")
 

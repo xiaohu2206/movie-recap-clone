@@ -80,11 +80,11 @@ def _run(args: list[str]) -> None:
         raise SystemExit(proc.returncode)
 
 
-def _stage(step: int, name: str, output_path: Path) -> None:
+def _stage(step: float, name: str, output_path: Path) -> None:
     print(f"[pipeline] {step}_{name} -> {output_path}", flush=True)
 
 
-def _stage_skipped(step: int, name: str, output_path: Path) -> None:
+def _stage_skipped(step: float, name: str, output_path: Path) -> None:
     print(f"[pipeline] {step}_{name} skipped -> {output_path}", flush=True)
 
 
@@ -101,7 +101,7 @@ def _has_valid_output(output_path: Path) -> bool:
     return True
 
 
-def _run_stage(step: int, name: str, output_path: Path, command: list[str], resume: bool) -> None:
+def _run_stage(step: float, name: str, output_path: Path, command: list[str], resume: bool) -> None:
     if resume and _has_valid_output(output_path):
         _stage_skipped(step, name, output_path)
         return
@@ -116,6 +116,8 @@ def _clean_stage_outputs(output_root: Path) -> None:
         "3_movie_shot_parser",
         "4_visual_alignment_engine",
         "5_script_visual_binder",
+        "5.1_movie_subtitle_filler",
+        "5.2_audio_role_classifier",
         "6_rewrite_engine",
         "7_timeline_composer",
         "8_generate_video",
@@ -130,6 +132,7 @@ def main() -> None:
     parser.add_argument("--ref-video-path", required=True)
     parser.add_argument("--movie-path", required=True)
     parser.add_argument("--subtitle-srt", help="existing subtitle for reference video; omit to run ASR")
+    parser.add_argument("--movie-subtitle-srt", default="", help="existing subtitle for movie video; omit to run ASR")
     parser.add_argument("--output-root", default=str(ROOT / "outputs"))
     parser.add_argument("--log-file", default="", help="append pipeline stdout/stderr to this file")
     parser.add_argument("--asr-provider", choices=["bcut", "none"], default="bcut")
@@ -162,6 +165,8 @@ def main() -> None:
     movie_dir = output_root / "3_movie_shot_parser"
     align_dir = output_root / "4_visual_alignment_engine"
     bind_dir = output_root / "5_script_visual_binder"
+    subtitle_dir = output_root / "5.1_movie_subtitle_filler"
+    audio_role_dir = output_root / "5.2_audio_role_classifier"
     rewrite_dir = output_root / "6_rewrite_engine"
     final_dir = output_root / "7_timeline_composer"
     generate_dir = output_root / "8_generate_video"
@@ -244,10 +249,42 @@ def main() -> None:
         args.resume,
     )
 
+    subtitle_cmd = [
+        str(ROOT / "5.1_movie_subtitle_filler" / "run.py"),
+        "--script-mapping",
+        str(bind_dir / "script_mapping.json"),
+        "--movie-path",
+        args.movie_path,
+        "--output-dir",
+        str(subtitle_dir),
+    ]
+    if args.movie_subtitle_srt:
+        subtitle_cmd += ["--movie-subtitle-srt", args.movie_subtitle_srt]
+    _run_stage(5.1, "movie_subtitle_filler", subtitle_dir / "script_mapping_subtitled.json", subtitle_cmd, args.resume)
+
+    audio_role_cmd = [
+        str(ROOT / "5.2_audio_role_classifier" / "run.py"),
+        "--script-mapping",
+        str(subtitle_dir / "script_mapping_subtitled.json"),
+        "--output-dir",
+        str(audio_role_dir),
+        "--provider",
+        args.ai_provider,
+        "--temperature",
+        str(args.ai_temperature),
+    ]
+    if args.ai_api_key:
+        audio_role_cmd += ["--api-key", args.ai_api_key]
+    if args.ai_base_url:
+        audio_role_cmd += ["--base-url", args.ai_base_url]
+    if args.ai_model:
+        audio_role_cmd += ["--model", args.ai_model]
+    _run_stage(5.2, "audio_role_classifier", audio_role_dir / "script_mapping_with_audio.json", audio_role_cmd, args.resume)
+
     rewrite_cmd = [
         str(ROOT / "6_rewrite_engine" / "run.py"),
         "--script-mapping",
-        str(bind_dir / "script_mapping.json"),
+        str(audio_role_dir / "script_mapping_with_audio.json"),
         "--output-dir",
         str(rewrite_dir),
         "--provider",
@@ -272,7 +309,7 @@ def main() -> None:
             "--rewritten-script",
             str(rewrite_dir / "rewritten_script.json"),
             "--script-mapping",
-            str(bind_dir / "script_mapping.json"),
+            str(audio_role_dir / "script_mapping_with_audio.json"),
             "--movie-shots",
             str(movie_dir / "movie_shots.json"),
             "--movie-source",
@@ -281,6 +318,8 @@ def main() -> None:
             str(final_dir),
             "--chars-per-second",
             str(args.chars_per_second),
+            "--output-root",
+            str(output_root),
         ],
         args.resume,
     )
@@ -302,6 +341,10 @@ def main() -> None:
             args.video_output_name,
             "--video-encoder",
             args.video_encoder,
+            "--script-mapping",
+            str(audio_role_dir / "script_mapping_with_audio.json"),
+            "--output-root",
+            str(output_root),
         ]
         if args.jianying_draft_dir:
             generate_cmd += ["--jianying-draft-dir", args.jianying_draft_dir]
