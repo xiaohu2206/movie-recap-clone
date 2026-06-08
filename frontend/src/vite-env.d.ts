@@ -15,8 +15,10 @@ export type PipelineEvent =
 
 export type BackendInfo = {
   root: string;
+  defaultOutputRoot: string;
   python: string;
   packaged: boolean;
+  hasBundledPython: boolean;
   hasLocalVenv: boolean;
 };
 

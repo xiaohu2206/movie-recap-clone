@@ -94,8 +94,8 @@
         "to": "backend/model"
       },
       {
-        "from": "../.venv",
-        "to": "backend/.venv",
+        "from": "../portable-python",
+        "to": "backend/python",
         "filter": [
           "**/*",
           "!**/__pycache__/**",

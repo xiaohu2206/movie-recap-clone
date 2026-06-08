@@ -311,7 +311,7 @@ function App() {
       setBackendInfo(info);
       setConfig((prev) => ({
         ...prev,
-        outputRoot: prev.outputRoot || `${info.root}\\outputs`,
+        outputRoot: prev.outputRoot || info.defaultOutputRoot || `${info.root}\\outputs`,
       }));
     });
 
