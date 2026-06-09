@@ -22,13 +22,49 @@ class _TorchNetNotAvailable(RuntimeError):
     pass
 
 
+def _format_torch_import_error(exc: BaseException) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    if os.name != "nt":
+        return message
+    lowered = message.lower()
+    if "1114" in message or "c10.dll" in lowered or "dll" in lowered:
+        message += (
+            "。常见原因：1) NVIDIA 驱动过旧，无法加载打包的 CUDA PyTorch"
+            "（cu128 需驱动≥570，cu124 需≥550，cu121 需≥530）；"
+            "2) 缺少 VC++ 2015-2022 运行库。"
+            "请更新显卡驱动后重试，或重新打包为 cu124/cu121/cpu 版 PyTorch。"
+        )
+    return message
+
+
+def _prepare_windows_torch_dll_path() -> None:
+    import sys
+
+    candidates: list[str] = []
+    for site in sys.path:
+        lib = os.path.join(site, "torch", "lib")
+        if os.path.isdir(lib):
+            candidates.append(lib)
+    if not candidates:
+        return
+    for lib in candidates:
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(lib)
+    prefix = os.pathsep.join(dict.fromkeys(candidates))
+    current = os.environ.get("PATH", "")
+    if not current.startswith(prefix):
+        os.environ["PATH"] = f"{prefix}{os.pathsep}{current}" if current else prefix
+
+
 def _import_torch():
     try:
+        if os.name == "nt":
+            _prepare_windows_torch_dll_path()
         import torch  # type: ignore
         import torch.nn as nn  # type: ignore
         import torch.nn.functional as functional  # type: ignore
     except Exception as e:
-        raise _TorchNetNotAvailable(str(e))
+        raise _TorchNetNotAvailable(_format_torch_import_error(e)) from e
     return torch, nn, functional
 
 
@@ -369,9 +405,15 @@ def _cuda_usable() -> bool:
         return False
 
 
+def _error_summary(error: BaseException) -> str:
+    message = str(error).strip() or error.__class__.__name__
+    return message[:500]
+
+
 class TransNetV2Torch:
     def __init__(self, model_dir: str, device: Optional[str] = None):
         self._device = self._resolve_device(device)
+        self._device_fallback_reason: Optional[str] = None
         self._lock = threading.Lock()
         self._model = _TransNetV2Net()
 
@@ -388,7 +430,7 @@ class TransNetV2Torch:
             state = state["state_dict"]
         self._model.load_state_dict(state)
         self._model.eval()
-        self._model.to(self._device)
+        self._move_model_to_device(self._device)
 
     def _resolve_device(self, device: Optional[str]) -> torch.device:
         raw = str(device or os.environ.get("TRANSNETV2_DEVICE") or "auto").strip().lower()
@@ -401,8 +443,27 @@ class TransNetV2Torch:
         except Exception:
             return torch.device("cuda") if _cuda_usable() else torch.device("cpu")
 
+    def _move_model_to_device(self, device: torch.device) -> None:
+        try:
+            self._model.to(device)
+        except Exception as exc:
+            if device.type != "cuda":
+                raise
+            self._fallback_to_cpu(exc)
+
+    def _fallback_to_cpu(self, error: BaseException) -> None:
+        reason = _error_summary(error)
+        logger.warning("[TransNetV2] CUDA failed; falling back to CPU: %s", reason)
+        self._device = torch.device("cpu")
+        self._device_fallback_reason = reason
+        self._model.to(self._device)
+
     def get_backend_info(self) -> dict:
-        return {"backend": "torch", "device": str(self._device)}
+        info = {"backend": "torch", "device": str(self._device)}
+        if self._device_fallback_reason:
+            info["device_fallback"] = "cpu"
+            info["device_fallback_reason"] = self._device_fallback_reason
+        return info
 
     def predict_raw(self, frames: np.ndarray):
         if not isinstance(frames, np.ndarray):
@@ -412,6 +473,15 @@ class TransNetV2Torch:
         if len(frames.shape) != 5 or list(frames.shape[2:]) != [27, 48, 3]:
             raise ValueError("frames shape must be [B, T, 27, 48, 3]")
 
+        try:
+            return self._predict_raw_on_current_device(frames)
+        except Exception as exc:
+            if self._device.type != "cuda":
+                raise
+            self._fallback_to_cpu(exc)
+            return self._predict_raw_on_current_device(frames)
+
+    def _predict_raw_on_current_device(self, frames: np.ndarray):
         x = torch.from_numpy(frames)
         if not x.is_contiguous():
             x = x.contiguous()

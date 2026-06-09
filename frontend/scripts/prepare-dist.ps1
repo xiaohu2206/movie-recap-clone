@@ -7,9 +7,14 @@ param(
 $ErrorActionPreference = "Stop"
 $Frontend = Split-Path -Parent $PSScriptRoot
 $Root = Split-Path -Parent $Frontend
+$FfmpegBin = Join-Path $Root "ffmpeg\bin"
+
+if (-not (Test-Path (Join-Path $FfmpegBin "ffmpeg.exe")) -or -not (Test-Path (Join-Path $FfmpegBin "ffprobe.exe"))) {
+  throw "missing bundled ffmpeg at $FfmpegBin (need ffmpeg.exe and ffprobe.exe)"
+}
 
 Write-Host "[prepare-dist] build portable python runtime"
-& (Join-Path $PSScriptRoot "build-portable-python.ps1") -TorchWheel cu128
+& (Join-Path $PSScriptRoot "build-portable-python.ps1") -TorchWheel cu124
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $env:ELECTRON_RUN_AS_NODE = $null

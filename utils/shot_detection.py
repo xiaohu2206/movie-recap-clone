@@ -17,6 +17,10 @@ ProgressCallback = Callable[[float, str], None]
 DEFAULT_KEYFRAME_POSITIONS = (0.12, 0.5, 0.88)
 
 
+class ShotDetectionBackendUnavailable(RuntimeError):
+    pass
+
+
 def _shot_id(prefix: str, idx: int) -> str:
     width = 6 if prefix == "movie_shot" else 3
     return f"{prefix}_{idx:0{width}d}"
@@ -82,7 +86,10 @@ def _detect_with_transnet(
     threshold: float,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[tuple[int, int]], int, dict[str, Any]]:
-    from .transnetv2_torch import TransNetV2Torch
+    try:
+        from .transnetv2_torch import TransNetV2Torch
+    except Exception as exc:
+        raise ShotDetectionBackendUnavailable(f"TransNetV2 unavailable: {exc}") from exc
 
     model = TransNetV2Torch(str(MODEL_DIR))
     if progress_callback:
@@ -199,8 +206,22 @@ def detect_shots(
     backend_info: dict[str, Any]
     if backend == "opencv":
         scenes, frame_count, backend_info = _detect_with_frame_diff(video_path, threshold, progress_callback)
+        backend_info["requested_backend"] = "opencv"
+    elif backend in {"auto", "transnet"}:
+        try:
+            scenes, frame_count, backend_info = _detect_with_transnet(video_path, threshold, progress_callback)
+        except ShotDetectionBackendUnavailable as exc:
+            if backend == "transnet":
+                raise
+            logger.warning("[shot_detection] TransNetV2 unavailable; falling back to OpenCV: %s", exc)
+            if progress_callback:
+                progress_callback(1.0, "TransNetV2 unavailable, falling back to OpenCV")
+            scenes, frame_count, backend_info = _detect_with_frame_diff(video_path, threshold, progress_callback)
+            backend_info["fallback_from"] = "transnet"
+            backend_info["fallback_reason"] = str(exc)[:500]
+        backend_info["requested_backend"] = backend
     else:
-        scenes, frame_count, backend_info = _detect_with_transnet(video_path, threshold, progress_callback)
+        raise ValueError(f"Unsupported shot detection backend: {backend}")
 
     min_frames = max(2, int(round(fps * 0.15)))
     scenes = _normalize_scenes(np.array(scenes, dtype=np.int32), frame_count, min_frames)
