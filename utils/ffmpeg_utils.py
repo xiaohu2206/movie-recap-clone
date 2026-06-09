@@ -64,9 +64,19 @@ def _resolve_bin(base: str) -> Optional[str]:
     roots.extend([Path.cwd(), Path(__file__).resolve().parents[2]])
 
     for root in roots:
-        for candidate in (root / name, root / "resources" / name, root / "src-tauri" / "resources" / name):
+        for candidate in (
+            root / name,
+            root / "ffmpeg" / "bin" / name,
+            root / "resources" / name,
+            root / "src-tauri" / "resources" / name,
+        ):
             if candidate.exists():
                 return str(candidate)
+
+    backend_root = Path(__file__).resolve().parents[1]
+    bundled = backend_root / "ffmpeg" / "bin" / name
+    if bundled.exists():
+        return str(bundled)
 
     if os.name == "nt":
         for candidate in (

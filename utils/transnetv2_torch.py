@@ -22,13 +22,49 @@ class _TorchNetNotAvailable(RuntimeError):
     pass
 
 
+def _format_torch_import_error(exc: BaseException) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    if os.name != "nt":
+        return message
+    lowered = message.lower()
+    if "1114" in message or "c10.dll" in lowered or "dll" in lowered:
+        message += (
+            "。常见原因：1) NVIDIA 驱动过旧，无法加载打包的 CUDA PyTorch"
+            "（cu128 需驱动≥570，cu124 需≥550，cu121 需≥530）；"
+            "2) 缺少 VC++ 2015-2022 运行库。"
+            "请更新显卡驱动后重试，或重新打包为 cu124/cu121/cpu 版 PyTorch。"
+        )
+    return message
+
+
+def _prepare_windows_torch_dll_path() -> None:
+    import sys
+
+    candidates: list[str] = []
+    for site in sys.path:
+        lib = os.path.join(site, "torch", "lib")
+        if os.path.isdir(lib):
+            candidates.append(lib)
+    if not candidates:
+        return
+    for lib in candidates:
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(lib)
+    prefix = os.pathsep.join(dict.fromkeys(candidates))
+    current = os.environ.get("PATH", "")
+    if not current.startswith(prefix):
+        os.environ["PATH"] = f"{prefix}{os.pathsep}{current}" if current else prefix
+
+
 def _import_torch():
     try:
+        if os.name == "nt":
+            _prepare_windows_torch_dll_path()
         import torch  # type: ignore
         import torch.nn as nn  # type: ignore
         import torch.nn.functional as functional  # type: ignore
     except Exception as e:
-        raise _TorchNetNotAvailable(str(e))
+        raise _TorchNetNotAvailable(_format_torch_import_error(e)) from e
     return torch, nn, functional
 
 

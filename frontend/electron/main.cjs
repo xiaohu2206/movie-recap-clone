@@ -64,6 +64,39 @@ function candidatePython(root) {
   return process.platform === "win32" ? "python" : "python3";
 }
 
+function bundledFfmpegDir(root) {
+  const binDir = path.join(root, "ffmpeg", "bin");
+  if (fs.existsSync(path.join(binDir, "ffmpeg.exe")) && fs.existsSync(path.join(binDir, "ffprobe.exe"))) {
+    return binDir;
+  }
+  return "";
+}
+
+function pythonRuntimeEnv(root, extra = {}) {
+  const env = {
+    ...process.env,
+    PYTHONIOENCODING: "utf-8",
+    ...extra,
+  };
+  const ffmpegDir = bundledFfmpegDir(root);
+  if (ffmpegDir) {
+    env.FFMPEG_DIR = ffmpegDir;
+    env.PATH = env.PATH ? `${ffmpegDir}${path.delimiter}${env.PATH}` : ffmpegDir;
+  }
+  if (process.platform !== "win32") {
+    return env;
+  }
+  const torchLibDirs = [
+    path.join(root, "python", "Lib", "site-packages", "torch", "lib"),
+    path.join(root, ".venv", "Lib", "site-packages", "torch", "lib"),
+  ].filter((item) => fs.existsSync(item));
+  if (torchLibDirs.length) {
+    const prefix = [...new Set(torchLibDirs)].join(path.delimiter);
+    env.PATH = env.PATH ? `${prefix}${path.delimiter}${env.PATH}` : prefix;
+  }
+  return env;
+}
+
 function sanitizeStoredPath(value) {
   if (!value || typeof value !== "string") {
     return "";
@@ -582,13 +615,11 @@ ipcMain.handle("pipeline:start", async (_event, rawConfig) => {
   const python = candidatePython(root);
   activeProcess = spawn(python, args, {
     cwd: root,
-    env: {
-      ...process.env,
-      PYTHONIOENCODING: "utf-8",
+    env: pythonRuntimeEnv(root, {
       CLONE_AI_API_KEY: aiApiKey,
       CLONE_AI_BASE_URL: aiBaseUrl,
       CLONE_AI_MODEL: aiModel,
-    },
+    }),
     windowsHide: true,
   });
 

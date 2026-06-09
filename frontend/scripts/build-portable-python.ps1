@@ -10,6 +10,7 @@ $Root = Split-Path -Parent $Frontend
 $Portable = Join-Path $Root "portable-python"
 $VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
 $Marker = Join-Path $Portable ".runtime-ready"
+$MarkerTorch = "torch=$TorchWheel"
 
 if (-not (Test-Path $VenvPy)) {
   Write-Host "[portable-python] creating .venv..."
@@ -33,9 +34,19 @@ if (-not (Test-Path (Join-Path $PythonSource "python.exe"))) {
   throw "python.exe not found in $PythonSource"
 }
 
+$ReuseRuntime = $false
 if (Test-Path $Marker) {
-  Write-Host "[portable-python] reuse existing runtime at $Portable"
-} else {
+  $markerText = Get-Content $Marker -Raw
+  if ($markerText -match [regex]::Escape($MarkerTorch)) {
+    $ReuseRuntime = $true
+    Write-Host "[portable-python] reuse existing runtime at $Portable ($MarkerTorch)"
+  } else {
+    Write-Host "[portable-python] torch wheel changed, rebuilding portable runtime"
+    Remove-Item $Marker -Force -ErrorAction SilentlyContinue
+  }
+}
+
+if (-not $ReuseRuntime) {
   if (Test-Path $Portable) {
     Remove-Item $Portable -Recurse -Force
   }
@@ -62,7 +73,7 @@ if (Test-Path $Marker) {
     throw "robocopy site-packages failed with exit code $LASTEXITCODE"
   }
 
-  Set-Content -Path $Marker -Value ("built-at=" + (Get-Date -Format "o")) -Encoding utf8
+  Set-Content -Path $Marker -Value ("built-at=" + (Get-Date -Format "o") + "`n" + $MarkerTorch) -Encoding utf8
 }
 
 Write-Host "[portable-python] verify imports"

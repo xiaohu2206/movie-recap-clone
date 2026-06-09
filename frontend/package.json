@@ -102,6 +102,15 @@
           "!**/*.pyc",
           "!**/*.pyo"
         ]
+      },
+      {
+        "from": "../ffmpeg/bin",
+        "to": "backend/ffmpeg/bin",
+        "filter": [
+          "ffmpeg.exe",
+          "ffprobe.exe",
+          "ffplay.exe"
+        ]
       }
     ],
     "win": {
