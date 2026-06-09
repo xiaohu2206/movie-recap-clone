@@ -164,6 +164,11 @@ def main() -> None:
     parser.add_argument("--video-encoder", choices=["auto", "libx264", "h264_nvenc"], default="auto")
     parser.add_argument("--resume", action="store_true", help="skip stages whose output already exists")
     parser.add_argument("--restart", action="store_true", help="clear stage outputs before running")
+    parser.add_argument(
+        "--render-only",
+        action="store_true",
+        help="re-run stage 8 only, reusing timeline outputs and existing TTS audio",
+    )
     args = parser.parse_args()
 
     output_root = Path(args.output_root)
@@ -183,6 +188,72 @@ def main() -> None:
     rewrite_dir = output_root / "6_rewrite_engine"
     final_dir = output_root / "7_timeline_composer"
     generate_dir = output_root / "8_generate_video"
+
+    if args.render_only:
+        if args.render_mode == "none":
+            raise SystemExit("--render-only requires --render-mode draft, video, or both")
+
+        if args.pipeline_mode == "ref_audio_rebuild":
+            rebuild_timeline = rebuild_dir / "ref_audio_rebuild_timeline.json"
+            if not _has_valid_output(rebuild_timeline):
+                raise SystemExit(f"ref_audio_rebuild timeline not found: {rebuild_timeline}")
+            generate_cmd = [
+                str(ROOT / "8_generate_video" / "run.py"),
+                "--timeline",
+                str(rebuild_timeline),
+                "--output-dir",
+                str(generate_dir),
+                "--mode",
+                args.render_mode,
+                "--voice-id",
+                args.edge_voice_id,
+                "--tts-speed",
+                str(args.edge_tts_speed),
+                "--video-output-name",
+                args.video_output_name,
+                "--video-encoder",
+                args.video_encoder,
+                "--ref-analysis",
+                str(ref_dir / "ref_analysis.json"),
+                "--output-root",
+                str(output_root),
+                "--reuse-tts",
+            ]
+        else:
+            final_timeline = final_dir / "final_timeline.json"
+            if not _has_valid_output(final_timeline):
+                raise SystemExit(f"final timeline not found: {final_timeline}")
+            generate_cmd = [
+                str(ROOT / "8_generate_video" / "run.py"),
+                "--timeline",
+                str(final_timeline),
+                "--output-dir",
+                str(generate_dir),
+                "--mode",
+                args.render_mode,
+                "--voice-id",
+                args.edge_voice_id,
+                "--tts-speed",
+                str(args.edge_tts_speed),
+                "--video-output-name",
+                args.video_output_name,
+                "--video-encoder",
+                args.video_encoder,
+                "--script-mapping",
+                str(audio_role_dir / "script_mapping_with_audio.json"),
+                "--output-root",
+                str(output_root),
+                "--reuse-tts",
+            ]
+
+        if args.jianying_draft_dir:
+            generate_cmd += ["--jianying-draft-dir", args.jianying_draft_dir]
+
+        _stage(8, "generate_video", generate_dir / "generate_video_result.json")
+        _run(generate_cmd)
+        print(generate_dir / "generate_video_result.json")
+        _unmount_log(log_mount)
+        return
 
     ref_cmd = [
         str(ROOT / "1_reference_analyzer" / "run.py"),

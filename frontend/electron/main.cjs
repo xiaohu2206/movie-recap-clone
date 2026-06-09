@@ -495,7 +495,8 @@ ipcMain.handle("pipeline:state", async (_event, config = {}) => {
     outputRoot,
     logPath,
     completed,
-    canResume: sameProject && completedStages.length > 0 && !completed,
+    canResume: completedStages.length > 0 && !completed,
+    configChanged: !sameProject,
     completedStages,
   };
 });
@@ -535,7 +536,8 @@ ipcMain.handle("pipeline:start", async (_event, rawConfig) => {
     return { ok: false, error: "已有任务正在运行" };
   }
 
-  const config = sanitizePipelineConfig(rawConfig);
+  const runMode = String(rawConfig?.runMode || "normal");
+  const config = { ...sanitizePipelineConfig(rawConfig), runMode };
   const root = projectRoot();
   const mainScript = path.join(root, "main.py");
   if (!fs.existsSync(mainScript)) {
@@ -610,21 +612,35 @@ ipcMain.handle("pipeline:start", async (_event, rawConfig) => {
   if (config.jianyingDraftDir) {
     args.push("--jianying-draft-dir", config.jianyingDraftDir);
   }
-  if (config.runMode === "resume") {
+  if (runMode === "render_only") {
+    if (renderMode === "none") {
+      return { ok: false, error: "请至少选择一种输出：剪映草稿或直出视频。" };
+    }
+    const prereqDir =
+      pipelineMode === "ref_audio_rebuild" ? "4.1_ref_audio_rebuild_composer" : "7_timeline_composer";
+    const prereqFile =
+      pipelineMode === "ref_audio_rebuild" ? "ref_audio_rebuild_timeline.json" : "final_timeline.json";
+    if (!hasValidJson(path.join(outputRoot, prereqDir, prereqFile))) {
+      return { ok: false, error: "未找到时间线产物，请先完成前序步骤。" };
+    }
+    args.push("--render-only");
+  } else if (runMode === "resume") {
     args.push("--resume");
-  }
-  if (config.runMode === "restart") {
+  } else if (runMode === "restart") {
     args.push("--restart");
   }
 
   fs.mkdirSync(outputRoot, { recursive: true });
   fs.mkdirSync(path.dirname(logPath), { recursive: true });
   fs.writeFileSync(logPath, `[${new Date().toISOString()}] [system] pipeline log created\n`, "utf8");
+  const existingCompletedStages = stageOutputs
+    .filter(([, dir, file]) => hasValidJson(path.join(outputRoot, dir, file)))
+    .map(([id]) => id);
   writePipelineMemory(outputRoot, {
     status: "running",
-    runMode: config.runMode || "normal",
+    runMode,
     configSignature: configSignature({ ...config, outputRoot, renderMode, pipelineMode }),
-    completedStages: [],
+    completedStages: runMode === "restart" ? [] : existingCompletedStages,
     exitCode: null,
     error: "",
   });
@@ -647,7 +663,10 @@ ipcMain.handle("pipeline:start", async (_event, rawConfig) => {
     command: `${python} ${args.map((item) => (item.includes(" ") ? `"${item}"` : item)).join(" ")}`,
     outputRoot,
     logPath,
+    runMode,
+    completedStages: runMode === "restart" ? [] : existingCompletedStages,
   });
+  appendPipelineLog(logPath, "system", `run mode: ${runMode}`);
   appendPipelineLog(logPath, "system", `${python} ${args.join(" ")}`);
 
   activeProcess.stdout.on("data", (chunk) => {

@@ -15,6 +15,11 @@ from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.project_paths import default_output_dir
 from clone_narration_video.utils.shot_breakdown import build_shot_breakdown
 
+MIN_ORIGINAL_PLAY_DURATION = 3.0
+ORIGINAL_MERGE_GAP = 0.35
+MOVIE_ROLLBACK_TOLERANCE = 0.05
+MIN_CLIP_DURATION = 0.03
+
 
 def _round(value: float) -> float:
     return round(float(value), 3)
@@ -78,6 +83,102 @@ def _base_ranges(item: dict[str, Any]) -> list[dict[str, Any]]:
     return ranges
 
 
+def _row_start(row: dict[str, Any]) -> float:
+    return float(row.get("start") or 0.0)
+
+
+def _row_end(row: dict[str, Any]) -> float:
+    return float(row.get("end") or 0.0)
+
+
+def _row_shot_ids(row: dict[str, Any]) -> list[str]:
+    return [str(x) for x in row.get("movie_shot_ids") or [] if str(x)]
+
+
+def _merge_movie_subtitles(target: dict[str, Any], row: dict[str, Any]) -> None:
+    merged = list(target.get("movie_subtitles") or [])
+    seen = {
+        (float(x.get("start") or 0.0), float(x.get("end") or 0.0), str(x.get("text") or ""))
+        for x in merged
+        if isinstance(x, dict)
+    }
+    for sub in row.get("movie_subtitles") or []:
+        if not isinstance(sub, dict):
+            continue
+        key = (float(sub.get("start") or 0.0), float(sub.get("end") or 0.0), str(sub.get("text") or ""))
+        if key not in seen:
+            merged.append(sub)
+            seen.add(key)
+    if merged:
+        target["movie_subtitles"] = merged
+
+
+def _coalesce_nearby_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for row in rows:
+        shot_ids = _row_shot_ids(row)
+        start = _row_start(row)
+        end = _row_end(row)
+        if end <= start:
+            continue
+        if merged:
+            last = merged[-1]
+            last_ids = _row_shot_ids(last)
+            shared_shot = bool(shot_ids and set(shot_ids).intersection(last_ids))
+            near_or_overlap = start <= _row_end(last) + ORIGINAL_MERGE_GAP
+            if shared_shot and near_or_overlap:
+                last["start"] = _round(min(_row_start(last), start))
+                last["end"] = _round(max(_row_end(last), end))
+                last["movie_shot_ids"] = list(dict.fromkeys([*last_ids, *shot_ids]))
+                _merge_movie_subtitles(last, row)
+                continue
+        merged.append(dict(row))
+    return merged
+
+
+def _visual_keys(row: dict[str, Any]) -> set[str]:
+    shot_ids = _row_shot_ids(row)
+    if shot_ids:
+        return {f"shot:{shot_id}" for shot_id in shot_ids}
+    return {f"time:{_row_start(row):.3f}-{_row_end(row):.3f}"}
+
+
+def _clip_visual_keys(clip: dict[str, Any]) -> set[str]:
+    shot_ids = [str(x) for x in clip.get("movie_shot_ids") or [] if str(x)]
+    if shot_ids:
+        return {f"shot:{shot_id}" for shot_id in shot_ids}
+    return {f"time:{float(clip.get('movie_start') or 0.0):.3f}-{float(clip.get('movie_end') or 0.0):.3f}"}
+
+
+def _prepare_rows_for_timeline(
+    rows: list[dict[str, Any]],
+    *,
+    used_visual_keys: set[str],
+    min_movie_start: float | None,
+) -> list[dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    local_keys: set[str] = set()
+    cursor = min_movie_start
+    for row in _coalesce_nearby_rows(rows):
+        keys = _visual_keys(row)
+        if keys.intersection(used_visual_keys) or keys.intersection(local_keys):
+            continue
+        start = _row_start(row)
+        end = _row_end(row)
+        if cursor is not None and start < cursor - MOVIE_ROLLBACK_TOLERANCE:
+            if end <= cursor + MIN_CLIP_DURATION:
+                continue
+            row = dict(row)
+            row["start"] = _round(cursor)
+            start = _row_start(row)
+        if end - start <= MIN_CLIP_DURATION:
+            continue
+        prepared.append(row)
+        local_keys.update(keys)
+        cursor = max(cursor if cursor is not None else end, end)
+    return prepared
+
+
 def _clip_index(row: dict[str, Any], fallback: int) -> int:
     try:
         return int(row.get("clip_index"))
@@ -113,48 +214,50 @@ def _sub_item(item: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any
     return clone
 
 
-def _used_movie_shot_ids(ranges: list[dict[str, Any]]) -> set[str]:
-    used: set[str] = set()
-    for row in ranges:
-        for shot_id in row.get("movie_shot_ids") or []:
-            used.add(str(shot_id))
-    return used
-
-
-def _extend_with_adjacent_shots(
-    clips: list[dict[str, Any]],
-    ranges: list[dict[str, Any]],
-    movie_shots: list[dict[str, Any]],
-    remaining: float,
-    source: str,
-) -> tuple[float, bool]:
-    if remaining <= 0 or not ranges or not movie_shots:
-        return remaining, False
-    used = _used_movie_shot_ids(ranges)
-    last_end = max(float(row.get("end") or 0.0) for row in ranges)
-    extended = False
-    for shot in movie_shots:
-        if remaining <= 0:
-            break
-        shot_id = str(shot.get("movie_shot_id") or "")
-        start = float(shot.get("start") or 0.0)
-        end = float(shot.get("end") or 0.0)
-        if shot_id in used or end <= start or start < last_end - 0.05:
+def _group_original_rows(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    for row in rows:
+        start = _row_start(row)
+        end = _row_end(row)
+        if end <= start:
             continue
-        take = min(end - start, remaining)
-        clips.append(
-            _clip(
-                len(clips) + 1,
-                start,
-                start + take,
-                source,
-                movie_shot_ids=[shot_id] if shot_id else [],
-                allocation="adjacent_extension",
-            )
-        )
-        remaining = _round(remaining - take)
-        extended = True
-    return remaining, extended
+        if groups and start <= _row_end(groups[-1][-1]) + ORIGINAL_MERGE_GAP:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    return groups
+
+
+def _group_span_duration(rows: list[dict[str, Any]]) -> float:
+    if not rows:
+        return 0.0
+    return _round(_row_end(rows[-1]) - _row_start(rows[0]))
+
+
+def _group_movie_shot_ids(rows: list[dict[str, Any]]) -> list[str]:
+    shot_ids: list[str] = []
+    for row in rows:
+        shot_ids.extend(_row_shot_ids(row))
+    return list(dict.fromkeys(shot_ids))
+
+
+def _group_ref_shot_ids(rows: list[dict[str, Any]]) -> list[str]:
+    return [
+        str(row.get("source_ref_shot_id"))
+        for row in rows
+        if row.get("source_ref_shot_id")
+    ]
+
+
+def _original_group_narration(base_item: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    text = " ".join(_subtitle_texts(rows)).strip()
+    if text:
+        return text
+    original_part = base_item.get("original_audio_part") or {}
+    subtitles = [str(x).strip() for x in original_part.get("subtitles") or [] if str(x).strip()]
+    if subtitles:
+        return " ".join(subtitles)
+    return str(base_item.get("new_text") or base_item.get("old_text") or "").strip()
 
 
 def allocate_video_clips(
@@ -211,13 +314,12 @@ def allocate_video_clips(
         )
 
     remaining = _round(tts_duration - available)
-    remaining, used_adjacent = _extend_with_adjacent_shots(clips, ranges, movie_shots, remaining, source)
     if remaining > 0.03 and clips:
         clips[-1]["movie_end"] = _round(float(clips[-1]["movie_end"]) + remaining)
         clips[-1]["duration"] = _round(float(clips[-1]["duration"]) + remaining)
         clips[-1]["allocation"] = "synthetic_extension"
         return clips, "extended_last_clip"
-    return clips, "extended_with_adjacent_shots" if used_adjacent else "kept_original"
+    return clips, "kept_original"
 
 
 def _confidence(item: dict[str, Any], clips: list[dict[str, Any]], allocation_status: str) -> str:
@@ -244,9 +346,28 @@ def compose_timeline(
     movie_shots = _movie_shot_rows(movie_shots_data)
     final_timeline = []
     cursor = 0.0
+    used_visual_keys: set[str] = set()
+    last_movie_end: float | None = None
+
+    def usable_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _prepare_rows_for_timeline(
+            rows,
+            used_visual_keys=used_visual_keys,
+            min_movie_start=last_movie_end,
+        )
+
+    def remember_clips(clips: list[dict[str, Any]]) -> None:
+        nonlocal last_movie_end
+        for clip in clips:
+            used_visual_keys.update(_clip_visual_keys(clip))
+            last_movie_end = max(
+                last_movie_end if last_movie_end is not None else float(clip.get("movie_end") or 0.0),
+                float(clip.get("movie_end") or 0.0),
+            )
 
     def append_narration_item(base_item: dict[str, Any], idx: int, suffix: str, narration: str) -> None:
         nonlocal cursor
+        base_item = _sub_item(base_item, usable_rows(_base_ranges(base_item)))
         tts_duration = estimate_tts_duration(narration, chars_per_second, min_duration)
         clips, allocation_status = allocate_video_clips(
             base_item,
@@ -281,48 +402,63 @@ def compose_timeline(
                 "audio_pattern": base_item.get("audio_pattern") or "all_narration",
             }
         )
+        remember_clips(clips)
         cursor = _round(cursor + tts_duration)
 
     def append_original_item(base_item: dict[str, Any], idx: int, suffix: str, rows: list[dict[str, Any]]) -> None:
         nonlocal cursor
-        duration = max(_range_duration(rows), min_duration)
-        clips = []
-        for clip_idx, row in enumerate(rows, start=1):
+        rows = usable_rows(rows)
+        groups = _group_original_rows(rows)
+        for group_index, group_rows in enumerate(groups, start=1):
+            group_suffix = suffix if len(groups) == 1 else f"{suffix}_{group_index:02d}"
+            duration = _group_span_duration(group_rows)
+            if duration < MIN_ORIGINAL_PLAY_DURATION:
+                narration = _original_group_narration(base_item, group_rows)
+                if narration:
+                    append_narration_item(
+                        _sub_item(base_item, group_rows),
+                        idx,
+                        f"{group_suffix}_narration",
+                        narration,
+                    )
+                continue
+
             clip = _clip(
-                clip_idx,
-                float(row.get("start") or 0.0),
-                float(row.get("end") or 0.0),
+                1,
+                _row_start(group_rows[0]),
+                _row_end(group_rows[-1]),
                 source,
-                source_ref_shot_id=row.get("source_ref_shot_id"),
-                movie_shot_ids=[str(x) for x in row.get("movie_shot_ids") or []],
-                allocation="original",
+                source_ref_shot_id=group_rows[0].get("source_ref_shot_id"),
+                movie_shot_ids=_group_movie_shot_ids(group_rows),
+                allocation="original_merged",
             )
             clip["keep_original_audio"] = True
-            clips.append(clip)
-        ref_range = base_item.get("ref_time_range") or {}
-        final_timeline.append(
-            {
-                "item_id": f"item_{idx:03d}{suffix}",
-                "segment_id": base_item.get("segment_id"),
-                "audio_type": "original_audio",
-                "keep_original_audio": True,
-                "narration": "",
-                "tts_duration": duration,
-                "timeline_start": _round(cursor),
-                "timeline_end": _round(cursor + duration),
-                "video_clips": clips,
-                "original_subtitles": _subtitle_texts(rows),
-                "ref_source": {
-                    "ref_start": ref_range.get("start"),
-                    "ref_end": ref_range.get("end"),
-                    "ref_shot_ids": [str(row.get("source_ref_shot_id")) for row in rows if row.get("source_ref_shot_id")],
-                },
-                "confidence": "medium" if clips else "low",
-                "allocation_status": "kept_original_audio" if clips else "missing_visual_ranges",
-                "audio_pattern": base_item.get("audio_pattern") or "all_original_audio",
-            }
-        )
-        cursor = _round(cursor + duration)
+            clips = [clip]
+            ref_range = base_item.get("ref_time_range") or {}
+            final_timeline.append(
+                {
+                    "item_id": f"item_{idx:03d}{group_suffix}",
+                    "segment_id": base_item.get("segment_id"),
+                    "audio_type": "original_audio",
+                    "keep_original_audio": True,
+                    "narration": "",
+                    "tts_duration": duration,
+                    "timeline_start": _round(cursor),
+                    "timeline_end": _round(cursor + duration),
+                    "video_clips": clips,
+                    "original_subtitles": _subtitle_texts(group_rows),
+                    "ref_source": {
+                        "ref_start": ref_range.get("start"),
+                        "ref_end": ref_range.get("end"),
+                        "ref_shot_ids": _group_ref_shot_ids(group_rows),
+                    },
+                    "confidence": "medium",
+                    "allocation_status": "kept_original_audio_merged",
+                    "audio_pattern": base_item.get("audio_pattern") or "all_original_audio",
+                }
+            )
+            remember_clips(clips)
+            cursor = _round(cursor + duration)
 
     for idx, item in enumerate(rewritten_script, start=1):
         pattern = str(item.get("audio_pattern") or "all_narration")
@@ -358,7 +494,10 @@ def compose_timeline(
             "tts_duration_estimator": "char_count",
             "chars_per_second": chars_per_second,
             "min_duration": min_duration,
-            "movie_shot_extension": bool(movie_shots),
+            "movie_shot_extension": False,
+            "min_original_play_duration": MIN_ORIGINAL_PLAY_DURATION,
+            "dedupe_movie_shots": True,
+            "prevent_movie_rollback": True,
         },
     }
 

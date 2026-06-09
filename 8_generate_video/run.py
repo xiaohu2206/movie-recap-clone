@@ -502,7 +502,8 @@ def _cut_video_clip(source: Path, start: float, duration: float, out_path: Path,
         ]
     else:
         cmd += [
-            "-an",
+            "-map",
+            "-0:a",
             "-vf",
             "setsar=1,format=yuv420p",
             *_video_codec_args(encoder),
@@ -685,7 +686,13 @@ def render_video(
         else:
             audio_path = Path(str(audio["path"]))
             visual_path = tmp_dir / f"{item_index:04d}_visual.mp4"
-            _concat_videos(clip_paths, visual_path, has_audio=False)
+            _concat_videos(
+                clip_paths,
+                visual_path,
+                reencode=True,
+                encoder=selected_encoder,
+                has_audio=False,
+            )
             _mux_item_with_audio(visual_path, audio_path, item_path, audio_duration, encoder=selected_encoder)
         _apply_item_audio_boundary_fades(item_path, encoder=selected_encoder)
         item_paths.append(item_path)
@@ -865,6 +872,7 @@ def generate_jianying_draft(
     assets_audio_dir.mkdir(parents=True, exist_ok=True)
 
     source_map: dict[str, tuple[str, Path]] = {}
+    silent_clip_map: dict[str, tuple[str, Path]] = {}
     audio_map: dict[str, tuple[str, Path, int]] = {}
     video_materials: list[dict[str, Any]] = []
     audio_materials: list[dict[str, Any]] = []
@@ -874,6 +882,9 @@ def generate_jianying_draft(
     timeline_cursor_us = 0
     first_video: Path | None = None
     total_items = len(items)
+    draft_encoder = _select_video_encoder("auto")
+    silent_cache_dir = assets_video_dir / "silent_clips"
+    silent_cache_dir.mkdir(parents=True, exist_ok=True)
 
     for item_index, item in enumerate(items, start=1):
         key = str(item.get("item_id") or item.get("segment_id") or f"item_{item_index:03d}")
@@ -884,23 +895,47 @@ def generate_jianying_draft(
         item_start_us = timeline_cursor_us
         item_duration_us = 0
 
-        for clip in clips:
+        for clip_index, clip in enumerate(clips, start=1):
             source_src = _source_path(str(clip.get("source") or ""))
-            source_key = str(source_src)
-            if source_key not in source_map:
-                copied = _copy_unique(source_src, assets_video_dir)
-                material_id = uuid.uuid4().hex
-                source_map[source_key] = (material_id, copied)
-                video_materials.append(_make_video_material(material_id, copied))
-                if first_video is None:
-                    first_video = copied
-            material_id, copied_path = source_map[source_key]
-            source_duration = probe_duration(copied_path)
             start = max(0.0, float(clip.get("movie_start") or 0.0))
             duration = max(0.03, float(clip.get("movie_end") or 0.0) - start)
-            if source_duration > 0:
-                duration = min(duration, max(0.03, source_duration - start))
+            source_start_us = _s_to_us(start)
+
+            if use_original_audio:
+                source_key = str(source_src)
+                if source_key not in source_map:
+                    copied = _copy_unique(source_src, assets_video_dir)
+                    material_id = uuid.uuid4().hex
+                    source_map[source_key] = (material_id, copied)
+                    video_materials.append(_make_video_material(material_id, copied))
+                    if first_video is None:
+                        first_video = copied
+                material_id, copied_path = source_map[source_key]
+                source_duration = probe_duration(copied_path)
+                if source_duration > 0:
+                    duration = min(duration, max(0.03, source_duration - start))
+            else:
+                clip_key = f"{source_src}|{start:.3f}|{duration:.3f}"
+                if clip_key not in silent_clip_map:
+                    silent_path = silent_cache_dir / f"{item_index:04d}_{clip_index:03d}.mp4"
+                    _cut_video_clip(
+                        source_src,
+                        start,
+                        duration,
+                        silent_path,
+                        encoder=draft_encoder,
+                        keep_audio=False,
+                    )
+                    material_id = uuid.uuid4().hex
+                    silent_clip_map[clip_key] = (material_id, silent_path)
+                    video_materials.append(_make_video_material(material_id, silent_path))
+                    if first_video is None:
+                        first_video = silent_path
+                material_id, _ = silent_clip_map[clip_key]
+                source_start_us = 0
+
             duration_us = _s_to_us(duration)
+            segment_volume = 1 if use_original_audio else 0
             speed_id = uuid.uuid4().hex
             speed_materials.append({"curve_speed": None, "id": speed_id, "mode": 0, "speed": 1, "type": "speed"})
             video_segments.append(
@@ -912,7 +947,7 @@ def generate_jianying_draft(
                     "enable_color_wheels": True,
                     "enable_lut": True,
                     "enable_smart_color_adjust": False,
-                    "last_nonzero_volume": 1,
+                    "last_nonzero_volume": segment_volume,
                     "reverse": False,
                     "track_attribute": 0,
                     "track_render_index": 0,
@@ -922,9 +957,9 @@ def generate_jianying_draft(
                     "target_timerange": {"start": timeline_cursor_us, "duration": duration_us},
                     "common_keyframes": [],
                     "keyframe_refs": [],
-                    "source_timerange": {"start": _s_to_us(start), "duration": duration_us},
+                    "source_timerange": {"start": source_start_us, "duration": duration_us},
                     "speed": 1,
-                    "volume": 1 if use_original_audio else 0,
+                    "volume": segment_volume,
                     "extra_material_refs": [speed_id],
                     "clip": {"alpha": 1, "flip": {"horizontal": False, "vertical": False}, "rotation": 0, "scale": {"x": 1, "y": 1}, "transform": {"x": 0, "y": 0}},
                     "uniform_scale": {"on": True, "value": 1},

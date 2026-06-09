@@ -6,7 +6,15 @@ export type DialogFileOptions = {
 };
 
 export type PipelineEvent =
-  | { type: "started"; at: string; command: string; outputRoot: string; logPath?: string }
+  | {
+      type: "started";
+      at: string;
+      command: string;
+      outputRoot: string;
+      logPath?: string;
+      runMode?: string;
+      completedStages?: string[];
+    }
   | { type: "stdout"; text: string }
   | { type: "stderr"; text: string }
   | { type: "error"; error: string; at: string }
@@ -28,6 +36,7 @@ export type PipelineState = {
   logPath?: string;
   completed: boolean;
   canResume: boolean;
+  configChanged?: boolean;
   completedStages: string[];
 };
 
