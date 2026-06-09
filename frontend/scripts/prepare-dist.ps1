@@ -7,19 +7,15 @@ param(
 $ErrorActionPreference = "Stop"
 $Frontend = Split-Path -Parent $PSScriptRoot
 $Root = Split-Path -Parent $Frontend
-$VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
+$FfmpegBin = Join-Path $Root "ffmpeg\bin"
 
-if (-not (Test-Path $VenvPy)) {
-  Write-Host "[prepare-dist] 未找到 .venv，正在创建（首次较慢）..."
-  & (Join-Path $Root "setup_venv.ps1") -TorchWheel cu128
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (-not (Test-Path (Join-Path $FfmpegBin "ffmpeg.exe")) -or -not (Test-Path (Join-Path $FfmpegBin "ffprobe.exe"))) {
+  throw "missing bundled ffmpeg at $FfmpegBin (need ffmpeg.exe and ffprobe.exe)"
 }
 
-Write-Host "[prepare-dist] 检查 Python 依赖..."
-& $VenvPy -c "import cv2, torch, numpy; print('[prepare-dist] cv2', cv2.__version__, '| torch', torch.__version__)"
-if ($LASTEXITCODE -ne 0) {
-  Write-Error "Python 依赖不完整，请在项目根目录运行 .\setup_venv.ps1 -TorchWheel cu128"
-}
+Write-Host "[prepare-dist] build portable python runtime"
+& (Join-Path $PSScriptRoot "build-portable-python.ps1") -TorchWheel cu128 -TorchFallback cu124
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $env:ELECTRON_RUN_AS_NODE = $null
 if (-not $env:ELECTRON_BUILDER_BINARIES_MIRROR) {
@@ -27,11 +23,11 @@ if (-not $env:ELECTRON_BUILDER_BINARIES_MIRROR) {
 }
 
 Set-Location $Frontend
-Write-Host "[prepare-dist] 构建前端..."
+Write-Host "[prepare-dist] build frontend"
 npm run build
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "[prepare-dist] 打包 Electron（含 .venv，体积约 5GB，请耐心等待）..."
+Write-Host "[prepare-dist] package electron with portable-python (about 5GB)"
 $builderArgs = @("--config.directories.output=$OutputDir")
 if ($Target -eq "dir") {
   $builderArgs += @("--win", "dir", "--x64")

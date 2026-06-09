@@ -250,6 +250,84 @@ def _cut_external_audio(item: dict[str, Any], out_path: Path, *, reuse: bool) ->
     }
 
 
+def _fade_duration(total: float) -> float:
+    return min(0.025, max(0.008, total / 5))
+
+
+def _trim_tts_audio(input_path: Path, output_path: Path) -> bool:
+    """仅裁掉 TTS 开头静音。尾部/句内停顿不能裁，否则会截断配音或产生爆音。"""
+    if not input_path.exists() or input_path.stat().st_size <= 0:
+        return False
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    af = (
+        "silenceremove="
+        "detection=rms:start_periods=1:start_duration=0.05:start_threshold=-45dB:"
+        "start_silence=0.08:stop_periods=0"
+    )
+    proc = run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(input_path),
+            "-af",
+            af,
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "2",
+            str(output_path),
+        ],
+        check=False,
+    )
+    return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
+
+
+def _apply_item_audio_boundary_fades(path: Path, *, encoder: str) -> Path:
+    """在片段首尾加短淡入淡出，减轻 narration / 原声切换时的爆音。"""
+    duration = probe_duration(path)
+    if duration <= 0.03:
+        return path
+    fade_d = _fade_duration(duration)
+    fade_out = max(0.0, duration - fade_d)
+    tmp = path.with_name(f"{path.stem}_fade{path.suffix}")
+    run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(path),
+            "-filter_complex",
+            (
+                f"[0:a]aresample=48000,afade=t=in:st=0:d={fade_d:.4f},"
+                f"afade=t=out:st={fade_out:.4f}:d={fade_d:.4f}[a]"
+            ),
+            "-map",
+            "0:v:0",
+            "-map",
+            "[a]",
+            *_video_codec_args(encoder),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-movflags",
+            "+faststart",
+            str(tmp),
+        ]
+    )
+    shutil.move(tmp, path)
+    return path
+
+
 def _retime_clips_to_audio(item: dict[str, Any], target_duration: float) -> list[dict[str, Any]]:
     clips = [c for c in (item.get("video_clips") or []) if isinstance(c, dict)]
     if not clips:
@@ -342,7 +420,10 @@ async def _synthesize_one(
     )
     if not result.get("success"):
         raise RuntimeError(f"Edge TTS 合成失败 {item_id}: {result.get('error') or result.get('message')}")
-    duration = float(result.get("duration") or 0.0) or probe_duration(out_path)
+    trim_path = out_path.with_name(f"{out_path.stem}_trim{out_path.suffix}")
+    if _trim_tts_audio(out_path, trim_path):
+        shutil.move(trim_path, out_path)
+    duration = probe_duration(out_path)
     if duration <= 0:
         raise RuntimeError(f"无法读取配音时长: {out_path}")
     return {"path": str(out_path), "duration": _round(duration), "voice_id": voice_id}
@@ -390,21 +471,21 @@ async def synthesize_timeline_audio(
 
 def _cut_video_clip(source: Path, start: float, duration: float, out_path: Path, *, encoder: str, keep_audio: bool = False) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    seek = f"{max(0.0, start):.3f}"
+    take = f"{max(0.03, duration):.3f}"
     cmd = [
         resolve_ffmpeg_bin(),
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
-        "-ss",
-        f"{max(0.0, start):.3f}",
-        "-t",
-        f"{max(0.03, duration):.3f}",
-        "-i",
-        str(source),
-        "-map",
-        "0:v:0",
     ]
+    # 保留原声时必须精确 seek，避免每个 clip 起点爆音
+    if keep_audio:
+        cmd += ["-i", str(source), "-ss", seek, "-t", take]
+    else:
+        cmd += ["-ss", seek, "-t", take, "-i", str(source)]
+    cmd += ["-map", "0:v:0"]
     if keep_audio:
         cmd += [
             "-map",
@@ -431,7 +512,14 @@ def _cut_video_clip(source: Path, start: float, duration: float, out_path: Path,
     return out_path
 
 
-def _concat_videos(paths: list[Path], out_path: Path, *, reencode: bool = False, encoder: str = "auto") -> Path:
+def _concat_videos(
+    paths: list[Path],
+    out_path: Path,
+    *,
+    reencode: bool = False,
+    encoder: str = "auto",
+    has_audio: bool = False,
+) -> Path:
     if not paths:
         raise ValueError("没有可拼接的视频片段")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -439,37 +527,74 @@ def _concat_videos(paths: list[Path], out_path: Path, *, reencode: bool = False,
         shutil.copy2(paths[0], out_path)
         return out_path
 
+    if reencode:
+        return _concat_clips_filter(paths, out_path, encoder=encoder, has_audio=has_audio)
+
     list_path = out_path.with_suffix(".concat.txt")
     list_path.write_text(
         "\n".join(f"file '{_quote_concat_path(p)}'" for p in paths),
         encoding="utf-8",
     )
-    cmd = [
-        resolve_ffmpeg_bin(),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(list_path),
-    ]
-    if reencode:
-        cmd += [
-            "-vf",
-            "setsar=1,format=yuv420p",
+    run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c",
+            "copy",
+            str(out_path),
+        ]
+    )
+    return out_path
+
+
+def _concat_clips_filter(paths: list[Path], out_path: Path, *, encoder: str, has_audio: bool) -> Path:
+    """用 filter concat 重编码拼接，比 concat demuxer 更不易产生音频爆音。"""
+    n = len(paths)
+    inputs: list[str] = [resolve_ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y"]
+    for path in paths:
+        inputs.extend(["-i", str(path)])
+
+    if has_audio:
+        streams = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(n))
+        fc = f"{streams}concat=n={n}:v=1:a=1[v][a]"
+        cmd = inputs + [
+            "-filter_complex",
+            fc,
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
             *_video_codec_args(encoder),
             "-c:a",
             "aac",
             "-b:a",
             "192k",
+            "-ar",
+            "48000",
+            "-movflags",
+            "+faststart",
+            str(out_path),
         ]
     else:
-        cmd += ["-c", "copy"]
-    cmd.append(str(out_path))
+        streams = "".join(f"[{i}:v:0]" for i in range(n))
+        fc = f"{streams}concat=n={n}:v=1:a=0[v]"
+        cmd = inputs + [
+            "-filter_complex",
+            fc,
+            "-map",
+            "[v]",
+            *_video_codec_args(encoder),
+            str(out_path),
+        ]
     run_ffmpeg(cmd)
     return out_path
 
@@ -478,6 +603,7 @@ def _mux_item_with_audio(visual_path: Path, audio_path: Path, out_path: Path, du
     visual_duration = probe_duration(visual_path)
     pad = max(0.0, duration - visual_duration)
     vf = f"tpad=stop_mode=clone:stop_duration={pad:.3f},trim=duration={duration:.3f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p"
+    af = f"aresample=48000,aformat=sample_rates=48000:channel_layouts=mono,atrim=0:{duration:.3f},asetpts=PTS-STARTPTS"
     run_ffmpeg(
         [
             resolve_ffmpeg_bin(),
@@ -490,7 +616,7 @@ def _mux_item_with_audio(visual_path: Path, audio_path: Path, out_path: Path, du
             "-i",
             str(audio_path),
             "-filter_complex",
-            f"[0:v]{vf}[v];[1:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS[a]",
+            f"[0:v]{vf}[v];[1:a]{af}[a]",
             "-map",
             "[v]",
             "-map",
@@ -549,12 +675,19 @@ def render_video(
 
         item_path = tmp_dir / f"{item_index:04d}_narrated.mp4"
         if use_original_audio:
-            _concat_videos(clip_paths, item_path, reencode=True, encoder=selected_encoder)
+            _concat_videos(
+                clip_paths,
+                item_path,
+                reencode=True,
+                encoder=selected_encoder,
+                has_audio=True,
+            )
         else:
             audio_path = Path(str(audio["path"]))
             visual_path = tmp_dir / f"{item_index:04d}_visual.mp4"
-            _concat_videos(clip_paths, visual_path)
+            _concat_videos(clip_paths, visual_path, has_audio=False)
             _mux_item_with_audio(visual_path, audio_path, item_path, audio_duration, encoder=selected_encoder)
+        _apply_item_audio_boundary_fades(item_path, encoder=selected_encoder)
         item_paths.append(item_path)
         print(f"[video] {key} clips={len(clip_paths)} {audio_duration:.3f}s")
         if progress_callback:
@@ -563,7 +696,7 @@ def render_video(
     output_path = output_dir / output_name
     if progress_callback:
         progress_callback(90.0, "Merging final video")
-    _concat_videos(item_paths, output_path, reencode=True, encoder=selected_encoder)
+    _concat_videos(item_paths, output_path, reencode=True, encoder=selected_encoder, has_audio=True)
     if progress_callback:
         progress_callback(100.0, "Video render complete")
     return {

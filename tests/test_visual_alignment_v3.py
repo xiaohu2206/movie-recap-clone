@@ -16,6 +16,9 @@ from utils.cli_bootstrap import add_project_to_syspath
 add_project_to_syspath()
 
 from clone_narration_video.utils.shot_detection import detect_shots
+import clone_narration_video.utils.shot_detection as shot_detection
+import clone_narration_video.utils.transnetv2_torch as transnet_torch
+from clone_narration_video.utils.asr.asr_bcut import BcutASR, BcutASRError, BCUT_MODEL_ID, _require_data
 from clone_narration_video.utils.visual_features import (
     compare_homography_frames,
     compare_normalized_frames,
@@ -75,6 +78,94 @@ class VisualAlignmentV3Tests(unittest.TestCase):
             self.assertLessEqual(len(shot["sample_frames"]), 4)
             for path in shot["keyframes"]:
                 self.assertTrue(Path(path).exists())
+
+    def test_bcut_missing_data_response_raises_descriptive_error(self) -> None:
+        with self.assertRaisesRegex(BcutASRError, "code=-400"):
+            _require_data({"code": -400, "message": "invalid task"}, "query result")
+
+    def test_bcut_query_uses_configured_model_id(self) -> None:
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict:
+                return {"data": {"state": 4, "result": "{}"}}
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.params = None
+
+            def get(self, url, params=None, headers=None):
+                self.params = params
+                return FakeResponse()
+
+        session = FakeSession()
+        asr = BcutASR.__new__(BcutASR)
+        asr.session = session
+        asr.task_id = "task_1"
+
+        self.assertEqual(asr.result()["state"], 4)
+        self.assertEqual(session.params["model_id"], BCUT_MODEL_ID)
+
+    def test_auto_backend_raises_when_transnet_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video_path = root / "clip.mp4"
+            writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (96, 64))
+            for idx in range(30):
+                color = 20 if idx < 15 else 210
+                frame = np.full((64, 96, 3), color, dtype=np.uint8)
+                writer.write(frame)
+            writer.release()
+
+            original = shot_detection._detect_with_transnet
+
+            def fail_transnet(*args, **kwargs):
+                raise RuntimeError("torch dll failed")
+
+            shot_detection._detect_with_transnet = fail_transnet
+            try:
+                with self.assertRaisesRegex(RuntimeError, "torch dll failed"):
+                    detect_shots(
+                        video_path,
+                        shot_prefix="ref_shot",
+                        keyframe_dir=root / "keyframes",
+                        backend="auto",
+                    )
+            finally:
+                shot_detection._detect_with_transnet = original
+
+    def test_transnet_cuda_inference_failure_retries_on_cpu(self) -> None:
+        class FakeModel:
+            def __init__(self) -> None:
+                self.devices: list[str] = []
+
+            def to(self, device):
+                self.devices.append(str(device))
+                return self
+
+        model = transnet_torch.TransNetV2Torch.__new__(transnet_torch.TransNetV2Torch)
+        model._device = transnet_torch.torch.device("cuda")
+        model._device_fallback_reason = None
+        model._model = FakeModel()
+        calls = {"count": 0}
+
+        def predict_once(frames):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("cuda init failed")
+            self.assertEqual(str(model._device), "cpu")
+            return np.zeros((1, 1), dtype=np.float32), None
+
+        model._predict_raw_on_current_device = predict_once
+        frames = np.zeros((1, 100, 27, 48, 3), dtype=np.uint8)
+        single, many = model.predict_raw(frames)
+
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(str(model._device), "cpu")
+        self.assertIn("cuda init failed", model.get_backend_info()["device_fallback_reason"])
+        self.assertEqual(single.shape, (1, 1))
+        self.assertIsNone(many)
 
     def test_normalized_frame_comparison_survives_borders_and_luma(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

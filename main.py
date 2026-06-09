@@ -14,9 +14,10 @@ ROOT = Path(__file__).resolve().parent
 
 
 def _stage_python() -> Path:
-    venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
-    if venv_python.exists():
-        return venv_python
+    for rel in (Path("python") / "python.exe", Path(".venv") / "Scripts" / "python.exe"):
+        candidate = ROOT / rel
+        if candidate.exists():
+            return candidate
     return Path(sys.executable)
 
 
