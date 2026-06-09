@@ -14,7 +14,7 @@ if (-not (Test-Path (Join-Path $FfmpegBin "ffmpeg.exe")) -or -not (Test-Path (Jo
 }
 
 Write-Host "[prepare-dist] build portable python runtime"
-& (Join-Path $PSScriptRoot "build-portable-python.ps1") -TorchWheel cu124
+& (Join-Path $PSScriptRoot "build-portable-python.ps1") -TorchWheel cu128 -TorchFallback cu124
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $env:ELECTRON_RUN_AS_NODE = $null

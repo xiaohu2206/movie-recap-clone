@@ -88,6 +88,9 @@ function pythonRuntimeEnv(root, extra = {}) {
   }
   const torchLibDirs = [
     path.join(root, "python", "Lib", "site-packages", "torch", "lib"),
+    path.join(root, "python", "torch_fallbacks", "cu128", "Lib", "site-packages", "torch", "lib"),
+    path.join(root, "python", "torch_fallbacks", "cu124", "Lib", "site-packages", "torch", "lib"),
+    path.join(root, "python", "torch_fallbacks", "cu121", "Lib", "site-packages", "torch", "lib"),
     path.join(root, ".venv", "Lib", "site-packages", "torch", "lib"),
   ].filter((item) => fs.existsSync(item));
   if (torchLibDirs.length) {

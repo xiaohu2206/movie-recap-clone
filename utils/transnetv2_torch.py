@@ -6,7 +6,7 @@ import os
 import time
 import threading
 import subprocess
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 try:
     from clone_narration_video.utils.ffmpeg_utils import get_ffmpeg_cuda_prefix, resolve_ffmpeg_bin
@@ -37,11 +37,56 @@ def _format_torch_import_error(exc: BaseException) -> str:
     return message
 
 
-def _prepare_windows_torch_dll_path() -> None:
+def _torch_site_candidates() -> list[tuple[str, str | None]]:
+    import sys
+    from pathlib import Path
+
+    candidates: list[tuple[str, str | None]] = [("primary", None)]
+    seen: set[str] = set()
+
+    env_root = os.environ.get("TORCH_FALLBACK_ROOT", "").strip()
+    if env_root:
+        for tag in ("cu128", "cu124", "cu121"):
+            fallback = Path(env_root) / tag / "Lib" / "site-packages"
+            if fallback.is_dir():
+                key = str(fallback)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append((f"{tag}-fallback", key))
+
+    for entry in sys.path:
+        entry_path = Path(entry)
+        if entry_path.name != "site-packages":
+            continue
+        python_root = entry_path.parent.parent
+        for tag in ("cu128", "cu124", "cu121"):
+            fallback = python_root / "torch_fallbacks" / tag / "Lib" / "site-packages"
+            if fallback.is_dir():
+                key = str(fallback)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append((f"{tag}-fallback", key))
+        break
+
+    return candidates
+
+
+def _purge_torch_modules() -> None:
+    import sys
+
+    for name in list(sys.modules):
+        if name == "torch" or name.startswith("torch."):
+            del sys.modules[name]
+
+
+def _prepare_windows_torch_dll_path(extra_sites: list[str] | None = None) -> None:
     import sys
 
     candidates: list[str] = []
-    for site in sys.path:
+    sites = list(extra_sites or []) + list(sys.path)
+    for site in sites:
+        if not site:
+            continue
         lib = os.path.join(site, "torch", "lib")
         if os.path.isdir(lib):
             candidates.append(lib)
@@ -56,16 +101,82 @@ def _prepare_windows_torch_dll_path() -> None:
         os.environ["PATH"] = f"{prefix}{os.pathsep}{current}" if current else prefix
 
 
-def _import_torch():
+def _load_torch_modules(label: str, site_path: str | None):
+    import sys
+
+    _purge_torch_modules()
+    inserted = False
+    if site_path:
+        sys.path.insert(0, site_path)
+        inserted = True
     try:
         if os.name == "nt":
-            _prepare_windows_torch_dll_path()
+            _prepare_windows_torch_dll_path([site_path] if site_path else None)
         import torch  # type: ignore
         import torch.nn as nn  # type: ignore
         import torch.nn.functional as functional  # type: ignore
-    except Exception as e:
-        raise _TorchNetNotAvailable(_format_torch_import_error(e)) from e
-    return torch, nn, functional
+        return torch, nn, functional
+    finally:
+        if inserted and site_path and site_path in sys.path:
+            sys.path.remove(site_path)
+
+
+def _cuda_failure_detail(torch_mod: Any, exc: BaseException) -> str:
+    parts = [_error_summary(exc)]
+    try:
+        if torch_mod.cuda.is_available() and torch_mod.cuda.device_count() > 0:
+            cap = torch_mod.cuda.get_device_capability(0)
+            parts.append(f"GPU={torch_mod.cuda.get_device_name(0)} sm_{cap[0]}{cap[1]}")
+    except Exception:
+        pass
+    return "; ".join(parts)
+
+
+def _cuda_usable_with(torch_mod: Any, label: str) -> bool:
+    if not torch_mod.cuda.is_available():
+        return False
+    try:
+        torch_mod.zeros(1, device="cuda")
+        if torch_mod.cuda.device_count() > 0:
+            cap = torch_mod.cuda.get_device_capability(0)
+            logger.info(
+                "[TransNetV2] CUDA ok with torch %s (%s, %s sm_%d%d)",
+                torch_mod.__version__,
+                label,
+                torch_mod.cuda.get_device_name(0),
+                cap[0],
+                cap[1],
+            )
+        return True
+    except Exception as exc:
+        logger.warning("[TransNetV2] %s CUDA 不可用: %s", label, _cuda_failure_detail(torch_mod, exc))
+        return False
+
+
+def _import_torch():
+    errors: list[str] = []
+    imported: list[tuple[Any, Any, Any, str]] = []
+
+    for label, site in _torch_site_candidates():
+        try:
+            torch_mod, nn_mod, functional_mod = _load_torch_modules(label, site)
+        except Exception as exc:
+            errors.append(f"{label}: {_format_torch_import_error(exc)}")
+            continue
+        if _cuda_usable_with(torch_mod, label):
+            return torch_mod, nn_mod, functional_mod
+        imported.append((torch_mod, nn_mod, functional_mod, label))
+
+    if imported:
+        torch_mod, nn_mod, functional_mod, label = imported[0]
+        logger.warning(
+            "[TransNetV2] 无可用 CUDA PyTorch，使用 CPU (%s %s)",
+            torch_mod.__version__,
+            label,
+        )
+        return torch_mod, nn_mod, functional_mod
+
+    raise _TorchNetNotAvailable("; ".join(errors) or "no torch installation found")
 
 
 torch, nn, functional = _import_torch()
@@ -395,14 +506,7 @@ import random
 
 
 def _cuda_usable() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        torch.zeros(1, device="cuda")
-        return True
-    except Exception:
-        logger.warning("[TransNetV2] CUDA 不可用或与当前 PyTorch 不兼容，回退 CPU")
-        return False
+    return _cuda_usable_with(torch, "active")
 
 
 def _error_summary(error: BaseException) -> str:

@@ -1,7 +1,9 @@
 param(
   [string]$PythonSource = "",
   [ValidateSet("cpu", "cu121", "cu124", "cu128")]
-  [string]$TorchWheel = "cu128"
+  [string]$TorchWheel = "cu128",
+  [ValidateSet("", "cu121", "cu124")]
+  [string]$TorchFallback = "cu124"
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,12 +12,38 @@ $Root = Split-Path -Parent $Frontend
 $Portable = Join-Path $Root "portable-python"
 $VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
 $Marker = Join-Path $Portable ".runtime-ready"
-$MarkerTorch = "torch=$TorchWheel"
+$MarkerTorch = if ($TorchFallback) { "torch=$TorchWheel+fallback=$TorchFallback" } else { "torch=$TorchWheel" }
+$VenvPip = Join-Path $Root ".venv\Scripts\pip.exe"
+
+function Install-TorchWheel {
+  param(
+    [string]$PythonExe,
+    [string]$PipExe,
+    [string]$Wheel
+  )
+  if ($Wheel -eq "cpu") {
+    & $PipExe install --force-reinstall torch --index-url https://download.pytorch.org/whl/cpu
+  } else {
+    & $PipExe install --force-reinstall torch --index-url "https://download.pytorch.org/whl/$Wheel"
+  }
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
 if (-not (Test-Path $VenvPy)) {
   Write-Host "[portable-python] creating .venv..."
   & (Join-Path $Root "setup_venv.ps1") -TorchWheel $TorchWheel
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} else {
+  $venvTorch = ""
+  try {
+    $venvTorch = & $VenvPy -c "import torch; print(torch.__version__)" 2>$null
+  } catch {
+    $venvTorch = ""
+  }
+  if (-not $venvTorch -or $venvTorch -notmatch "\+$TorchWheel(\b|$)") {
+    Write-Host "[portable-python] ensuring venv primary torch=$TorchWheel (was: $venvTorch)"
+    Install-TorchWheel -PythonExe $VenvPy -PipExe $VenvPip -Wheel $TorchWheel
+  }
 }
 
 if (-not $PythonSource) {
@@ -71,6 +99,14 @@ if (-not $ReuseRuntime) {
   robocopy $SiteSrc $SiteDest /E /XD "__pycache__" /XF "*.pyc" /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
   if ($LASTEXITCODE -ge 8) {
     throw "robocopy site-packages failed with exit code $LASTEXITCODE"
+  }
+
+  if ($TorchFallback) {
+    $FallbackSite = Join-Path $Portable ("torch_fallbacks\{0}\Lib\site-packages" -f $TorchFallback)
+    New-Item -ItemType Directory -Path $FallbackSite -Force | Out-Null
+    Write-Host "[portable-python] install torch fallback $TorchFallback"
+    & (Join-Path $Portable "python.exe") -m pip install --upgrade --target $FallbackSite torch --index-url "https://download.pytorch.org/whl/$TorchFallback"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   }
 
   Set-Content -Path $Marker -Value ("built-at=" + (Get-Date -Format "o") + "`n" + $MarkerTorch) -Encoding utf8
