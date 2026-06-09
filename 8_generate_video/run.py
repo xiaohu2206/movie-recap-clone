@@ -193,6 +193,63 @@ def _is_original_audio_item(item: dict[str, Any], audio: dict[str, Any] | None =
     return str(item.get("audio_type") or "").lower() == "original_audio" or item.get("keep_original_audio") is True
 
 
+def _is_reference_audio_item(item: dict[str, Any]) -> bool:
+    return str(item.get("audio_type") or "").lower() == "reference_audio" or isinstance(item.get("external_audio"), dict)
+
+
+def _cut_external_audio(item: dict[str, Any], out_path: Path, *, reuse: bool) -> dict[str, Any]:
+    external = item.get("external_audio") or {}
+    if not isinstance(external, dict):
+        raise ValueError("reference_audio item 缺少 external_audio")
+
+    source = _source_path(str(external.get("path") or ""))
+    start = max(0.0, float(external.get("start") or 0.0))
+    end = external.get("end")
+    expected_duration = float(external.get("duration") or 0.0)
+    if expected_duration <= 0 and end is not None:
+        expected_duration = max(0.0, float(end) - start)
+    if expected_duration <= 0:
+        expected_duration = max(_item_duration_from_clips(item), 0.3)
+
+    if reuse and out_path.exists() and out_path.stat().st_size > 0:
+        duration = probe_duration(out_path) or expected_duration
+        return {"path": str(out_path), "duration": _round(duration), "source": "reference_audio", "reused": True}
+
+    run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{max(0.03, expected_duration):.3f}",
+            "-i",
+            str(source),
+            "-vn",
+            "-map",
+            "0:a:0?",
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "3",
+            "-ar",
+            "48000",
+            str(out_path),
+        ]
+    )
+    duration = probe_duration(out_path) or expected_duration
+    return {
+        "path": str(out_path),
+        "duration": _round(duration),
+        "source": "reference_audio",
+        "source_path": str(source),
+        "source_start": _round(start),
+    }
+
+
 def _retime_clips_to_audio(item: dict[str, Any], target_duration: float) -> list[dict[str, Any]]:
     clips = [c for c in (item.get("video_clips") or []) if isinstance(c, dict)]
     if not clips:
@@ -245,6 +302,9 @@ async def _synthesize_one(
     if _is_original_audio_item(item):
         duration = max(_item_duration_from_clips(item), float(item.get("tts_duration") or 0.0), 0.3)
         return {"path": "", "duration": _round(duration), "use_original_audio": True}
+
+    if _is_reference_audio_item(item):
+        return _cut_external_audio(item, out_path, reuse=reuse)
 
     if not narration:
         duration = max(float(item.get("tts_duration") or 0.0), _item_duration_from_clips(item), 0.3)
@@ -914,6 +974,7 @@ async def async_main(args: argparse.Namespace) -> None:
                 "path": relpath(v["path"]) if v.get("path") else "",
                 "duration": v["duration"],
                 "use_original_audio": bool(v.get("use_original_audio")),
+                "source": v.get("source") or "",
             }
             for k, v in audio_results.items()
         },

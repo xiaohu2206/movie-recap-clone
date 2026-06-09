@@ -49,6 +49,15 @@ def _mount_log(log_file: str) -> tuple[TextIO, TextIO, TextIO] | None:
     return file, original_stdout, original_stderr
 
 
+def _unmount_log(log_mount: tuple[TextIO, TextIO, TextIO] | None) -> None:
+    if not log_mount:
+        return
+    log_handle, original_stdout, original_stderr = log_mount
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+    log_handle.close()
+
+
 def _pipe_stream(stream: TextIO | None, target: TextIO) -> None:
     if stream is None:
         return
@@ -115,6 +124,7 @@ def _clean_stage_outputs(output_root: Path) -> None:
         "2_narration_segmenter",
         "3_movie_shot_parser",
         "4_visual_alignment_engine",
+        "4.1_ref_audio_rebuild_composer",
         "5_script_visual_binder",
         "5.1_movie_subtitle_filler",
         "5.2_audio_role_classifier",
@@ -129,6 +139,7 @@ def _clean_stage_outputs(output_root: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="clone_narration_video pipeline")
+    parser.add_argument("--pipeline-mode", choices=["clone", "ref_audio_rebuild"], default="clone")
     parser.add_argument("--ref-video-path", required=True)
     parser.add_argument("--movie-path", required=True)
     parser.add_argument("--subtitle-srt", help="existing subtitle for reference video; omit to run ASR")
@@ -164,6 +175,7 @@ def main() -> None:
     seg_dir = output_root / "2_narration_segmenter"
     movie_dir = output_root / "3_movie_shot_parser"
     align_dir = output_root / "4_visual_alignment_engine"
+    rebuild_dir = output_root / "4.1_ref_audio_rebuild_composer"
     bind_dir = output_root / "5_script_visual_binder"
     subtitle_dir = output_root / "5.1_movie_subtitle_filler"
     audio_role_dir = output_root / "5.2_audio_role_classifier"
@@ -233,6 +245,65 @@ def main() -> None:
         ],
         args.resume,
     )
+
+    if args.pipeline_mode == "ref_audio_rebuild":
+        _run_stage(
+            4.1,
+            "ref_audio_rebuild_composer",
+            rebuild_dir / "ref_audio_rebuild_timeline.json",
+            [
+                str(ROOT / "4.1_ref_audio_rebuild_composer" / "run.py"),
+                "--ref-analysis",
+                str(ref_dir / "ref_analysis.json"),
+                "--movie-shots",
+                str(movie_dir / "movie_shots.json"),
+                "--timeline",
+                str(align_dir / "ref_to_movie_timeline.json"),
+                "--ref-video-path",
+                args.ref_video_path,
+                "--movie-path",
+                args.movie_path,
+                "--output-dir",
+                str(rebuild_dir),
+            ],
+            args.resume,
+        )
+
+        rebuild_timeline = rebuild_dir / "ref_audio_rebuild_timeline.json"
+        if args.render_mode != "none":
+            generate_cmd = [
+                str(ROOT / "8_generate_video" / "run.py"),
+                "--timeline",
+                str(rebuild_timeline),
+                "--output-dir",
+                str(generate_dir),
+                "--mode",
+                args.render_mode,
+                "--voice-id",
+                args.edge_voice_id,
+                "--tts-speed",
+                str(args.edge_tts_speed),
+                "--video-output-name",
+                args.video_output_name,
+                "--video-encoder",
+                args.video_encoder,
+                "--ref-analysis",
+                str(ref_dir / "ref_analysis.json"),
+                "--output-root",
+                str(output_root),
+            ]
+            if args.jianying_draft_dir:
+                generate_cmd += ["--jianying-draft-dir", args.jianying_draft_dir]
+            if args.resume:
+                generate_cmd += ["--reuse-tts"]
+            _run_stage(8, "generate_video", generate_dir / "generate_video_result.json", generate_cmd, args.resume)
+            print(generate_dir / "generate_video_result.json")
+        else:
+            print(rebuild_timeline)
+
+        _unmount_log(log_mount)
+        return
+
     _run_stage(
         5,
         "script_visual_binder",
@@ -355,11 +426,7 @@ def main() -> None:
     else:
         print(final_dir / "final_timeline.json")
 
-    if log_mount:
-        log_handle, original_stdout, original_stderr = log_mount
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        log_handle.close()
+    _unmount_log(log_mount)
 
 
 if __name__ == "__main__":

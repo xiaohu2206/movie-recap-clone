@@ -70,6 +70,10 @@
         "to": "backend/4_visual_alignment_engine"
       },
       {
+        "from": "../4.1_ref_audio_rebuild_composer",
+        "to": "backend/4.1_ref_audio_rebuild_composer"
+      },
+      {
         "from": "../5_script_visual_binder",
         "to": "backend/5_script_visual_binder"
       },

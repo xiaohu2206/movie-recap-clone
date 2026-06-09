@@ -90,6 +90,7 @@ const stageOutputs = [
   ["segments", "2_narration_segmenter", "narration_segments.json"],
   ["shots", "3_movie_shot_parser", "movie_shots.json"],
   ["alignment", "4_visual_alignment_engine", "ref_to_movie_timeline.json"],
+  ["ref_audio_rebuild", "4.1_ref_audio_rebuild_composer", "ref_audio_rebuild_timeline.json"],
   ["binder", "5_script_visual_binder", "script_mapping.json"],
   ["subtitle", "5.1_movie_subtitle_filler", "script_mapping_subtitled.json"],
   ["audio_role", "5.2_audio_role_classifier", "script_mapping_with_audio.json"],
@@ -137,6 +138,7 @@ function appendPipelineLog(logPath, level, text) {
 
 function configSignature(config = {}) {
   return JSON.stringify({
+    pipelineMode: config.pipelineMode || "clone",
     refVideoPath: config.refVideoPath || "",
     moviePath: config.moviePath || "",
     subtitlePath: config.subtitlePath || "",
@@ -181,8 +183,11 @@ function writePipelineMemory(outputRoot, payload) {
   }
 }
 
-function hasCompletedFinalOutput(outputRoot, renderMode) {
+function hasCompletedFinalOutput(outputRoot, renderMode, pipelineMode = "clone") {
   if (renderMode === "none") {
+    if (pipelineMode === "ref_audio_rebuild") {
+      return hasValidJson(path.join(outputRoot, "4.1_ref_audio_rebuild_composer", "ref_audio_rebuild_timeline.json"));
+    }
     return hasValidJson(path.join(outputRoot, "7_timeline_composer", "final_timeline.json"));
   }
 
@@ -401,11 +406,12 @@ ipcMain.handle("pipeline:state", async (_event, config = {}) => {
   const root = projectRoot();
   const outputRoot = config.outputRoot || path.join(root, "outputs");
   const logPath = pipelineLogPath(outputRoot);
+  const pipelineMode = config.pipelineMode || "clone";
   const completedStages = stageOutputs
     .filter(([, dir, file]) => hasValidJson(path.join(outputRoot, dir, file)))
     .map(([id]) => id);
-  const finalStage = config.renderMode === "none" ? "timeline" : "render";
-  const finalOutputComplete = completedStages.includes(finalStage) && hasCompletedFinalOutput(outputRoot, config.renderMode);
+  const finalStage = config.renderMode === "none" ? (pipelineMode === "ref_audio_rebuild" ? "ref_audio_rebuild" : "timeline") : "render";
+  const finalOutputComplete = completedStages.includes(finalStage) && hasCompletedFinalOutput(outputRoot, config.renderMode, pipelineMode);
   const memory = readPipelineMemory(outputRoot);
   const sameProject = !memory?.configSignature || memory.configSignature === configSignature({ ...config, outputRoot });
   const completed = finalOutputComplete && (!memory || memory.status === "completed");
@@ -471,6 +477,7 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   const outputRoot = config.outputRoot || path.join(root, "outputs");
   const logPath = pipelineLogPath(outputRoot);
   const renderMode = config.renderMode || "draft";
+  const pipelineMode = config.pipelineMode || "clone";
   if ((renderMode === "draft" || renderMode === "both") && config.jianyingDraftDir && !fs.existsSync(config.jianyingDraftDir)) {
     return { ok: false, error: `剪映草稿路径不存在: ${config.jianyingDraftDir}` };
   }
@@ -479,6 +486,8 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   const aiModel = String(config.aiModel || process.env.CLONE_AI_MODEL || process.env.OPENAI_MODEL || "").trim();
   const args = [
     mainScript,
+    "--pipeline-mode",
+    pipelineMode,
     "--ref-video-path",
     config.refVideoPath,
     "--movie-path",
@@ -539,7 +548,7 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   writePipelineMemory(outputRoot, {
     status: "running",
     runMode: config.runMode || "normal",
-    configSignature: configSignature({ ...config, outputRoot, renderMode }),
+    configSignature: configSignature({ ...config, outputRoot, renderMode, pipelineMode }),
     completedStages: [],
     exitCode: null,
     error: "",

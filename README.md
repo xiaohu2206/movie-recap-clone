@@ -210,6 +210,26 @@ python .\4_visual_alignment_engine\run.py `
 outputs\4_visual_alignment_engine\ref_to_movie_timeline.json
 ```
 
+### 4.1 参考音频画面重组时间线
+
+这是参考音频画面重组分支。它复用参考视频原音频，用第 4 步定位到的原片画面生成可直接交给第 8 步的时间线；不需要执行第 2、5、5.1、5.2、6、7 步。
+
+```powershell
+python .\4.1_ref_audio_rebuild_composer\run.py `
+  --ref-analysis .\outputs\1_reference_analyzer\ref_analysis.json `
+  --movie-shots .\outputs\3_movie_shot_parser\movie_shots.json `
+  --timeline .\outputs\4_visual_alignment_engine\ref_to_movie_timeline.json `
+  --ref-video-path .\data\ref.mp4 `
+  --movie-path .\data\movie.mp4 `
+  --output-dir .\outputs\4.1_ref_audio_rebuild_composer
+```
+
+输出：
+
+```text
+outputs\4.1_ref_audio_rebuild_composer\ref_audio_rebuild_timeline.json
+```
+
 ### 5. 解说画面绑定
 
 ```powershell
@@ -317,6 +337,20 @@ python .\main.py `
 
 最终输出位于 `outputs\7_timeline_composer\final_timeline.json`。
 
+参考音频画面重组分支完整运行：
+
+```powershell
+python .\main.py `
+  --pipeline-mode ref_audio_rebuild `
+  --ref-video-path .\data\ref.mp4 `
+  --movie-path .\data\movie.mp4 `
+  --subtitle-srt .\data\ref.srt `
+  --render-mode both `
+  --video-encoder auto
+```
+
+重组分支会运行 `1 -> 3 -> 4 -> 4.1 -> 8`。如果只想生成重组时间线，把 `--render-mode both` 改成 `--render-mode none`。
+
 ## 第 8 步：生成剪映草稿 / 直接生成视频
 
 同时生成剪映草稿和 mp4：
@@ -361,6 +395,21 @@ outputs\8_generate_video\jianying_drafts\
 outputs\8_generate_video\clone_narration_output.mp4
 outputs\8_generate_video\generate_video_result.json
 ```
+
+使用参考音频画面重组时间线渲染：
+
+```powershell
+python .\8_generate_video\run.py `
+  --timeline .\outputs\4.1_ref_audio_rebuild_composer\ref_audio_rebuild_timeline.json `
+  --output-dir .\outputs\8_generate_video `
+  --ref-analysis .\outputs\1_reference_analyzer\ref_analysis.json `
+  --output-root .\outputs `
+  --mode both `
+  --video-output-name ref_audio_rebuild_output.mp4 `
+  --video-encoder auto
+```
+
+这条命令会从参考视频中按 `external_audio.start/end` 切出音频片段，不会调用 TTS。
 
 完整流水线最后也可以追加渲染：
 ```powershell

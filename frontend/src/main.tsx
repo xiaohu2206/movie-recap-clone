@@ -27,10 +27,12 @@ import {
 import "./styles.css";
 
 type RenderMode = "none" | "draft" | "video" | "both";
+type PipelineMode = "clone" | "ref_audio_rebuild";
 type BackendMode = "auto" | "transnet" | "opencv";
 type VideoEncoder = "auto" | "libx264" | "h264_nvenc";
 
 type PipelineConfig = {
+  pipelineMode: PipelineMode;
   refVideoPath: string;
   moviePath: string;
   subtitlePath: string;
@@ -122,6 +124,14 @@ const stages: Stage[] = [
     patterns: ["4_visual_alignment_engine", "ref_to_movie_timeline.json"],
   },
   {
+    id: "ref_audio_rebuild",
+    step: 4.1,
+    title: "参考音频重组",
+    detail: "复用参考视频原音频，并替换为对齐后的原片画面。",
+    output: "outputs/4.1_ref_audio_rebuild_composer/ref_audio_rebuild_timeline.json",
+    patterns: ["4.1_ref_audio_rebuild_composer", "ref_audio_rebuild_timeline.json"],
+  },
+  {
     id: "binder",
     step: 5,
     title: "脚本画面绑定",
@@ -172,6 +182,7 @@ const stages: Stage[] = [
 ];
 
 const defaultConfig: PipelineConfig = {
+  pipelineMode: "clone",
   refVideoPath: "",
   moviePath: "",
   subtitlePath: "",
@@ -250,13 +261,19 @@ function outputPath(root: string, relative: string) {
   return `${root.replace(/[\\/]$/, "")}\\${relative.replace("outputs/", "").replace(/\//g, "\\")}`;
 }
 
-function isStageEnabled(stage: Stage, renderMode: RenderMode) {
-  return renderMode !== "none" || stage.id !== "render";
+function isStageEnabled(stage: Stage, renderMode: RenderMode, pipelineMode: PipelineMode) {
+  if (stage.id === "render") {
+    return renderMode !== "none";
+  }
+  if (pipelineMode === "ref_audio_rebuild") {
+    return ["reference", "shots", "alignment", "ref_audio_rebuild"].includes(stage.id);
+  }
+  return stage.id !== "ref_audio_rebuild";
 }
 
-function createStageStates(renderMode: RenderMode) {
+function createStageStates(renderMode: RenderMode, pipelineMode: PipelineMode) {
   return Object.fromEntries(
-    stages.map((stage) => [stage.id, isStageEnabled(stage, renderMode) ? "waiting" : "skipped"]),
+    stages.map((stage) => [stage.id, isStageEnabled(stage, renderMode, pipelineMode) ? "waiting" : "skipped"]),
   ) as Record<string, StageState>;
 }
 
@@ -292,7 +309,7 @@ function App() {
   const [logLines, setLogLines] = useState<LogLine[]>([
     { id: 1, level: "system", text: "工作台已就绪。请选择参考视频和原片后启动流水线。" },
   ]);
-  const [stageStates, setStageStates] = useState<Record<string, StageState>>(() => createStageStates(defaultConfig.renderMode));
+  const [stageStates, setStageStates] = useState<Record<string, StageState>>(() => createStageStates(defaultConfig.renderMode, defaultConfig.pipelineMode));
   const [stageProgress, setStageProgress] = useState<Record<string, StageProgress>>({});
   const [aiTest, setAiTest] = useState<{ status: "idle" | "testing" | "ok" | "error"; message: string }>({
     status: "idle",
@@ -321,7 +338,7 @@ function App() {
         setStartedAt(new Date());
         setFinishedCode(null);
         setPipelineLogPath(event.logPath || `${event.outputRoot}\\logs\\pipeline.log`);
-        setStageStates(createStageStates(config.renderMode));
+        setStageStates(createStageStates(config.renderMode, config.pipelineMode));
         setStageProgress({});
         pushLog("system", `启动命令: ${event.command}`);
         pushLog("system", `输出目录: ${event.outputRoot}`);
@@ -357,7 +374,7 @@ function App() {
             ) as Record<string, StageState>;
           }
           return Object.fromEntries(
-            stages.map((stage) => [stage.id, isStageEnabled(stage, config.renderMode) ? "done" : "skipped"]),
+                stages.map((stage) => [stage.id, isStageEnabled(stage, config.renderMode, config.pipelineMode) ? "done" : "skipped"]),
           ) as Record<string, StageState>;
         });
         if (event.code === 0) {
@@ -365,7 +382,7 @@ function App() {
             Object.fromEntries(
               stages.map((stage) => [
                 stage.id,
-                previous[stage.id] ?? { percent: isStageEnabled(stage, config.renderMode) ? 100 : 0, message: "" },
+                previous[stage.id] ?? { percent: isStageEnabled(stage, config.renderMode, config.pipelineMode) ? 100 : 0, message: "" },
               ]),
             ) as Record<string, StageProgress>,
           );
@@ -375,7 +392,7 @@ function App() {
     });
 
     return unsubscribe;
-  }, [config.renderMode]);
+  }, [config.renderMode, config.pipelineMode]);
 
   useEffect(() => {
     if (logRef.current) {
@@ -410,6 +427,14 @@ function App() {
     }, 400);
     return () => clearTimeout(timer);
   }, [config]);
+
+  useEffect(() => {
+    if (isRunning) {
+      return;
+    }
+    setStageStates(createStageStates(config.renderMode, config.pipelineMode));
+    setStageProgress({});
+  }, [config.renderMode, config.pipelineMode, isRunning]);
 
   function pushLog(level: LogLine["level"], text: string) {
     const clean = text.trim();
@@ -472,7 +497,7 @@ function App() {
     setStageStates((previous) => {
       return Object.fromEntries(
         stages.map((stage, index) => {
-          if (!isStageEnabled(stage, config.renderMode)) {
+          if (!isStageEnabled(stage, config.renderMode, config.pipelineMode)) {
             return [stage.id, "skipped"];
           }
           if (previous[stage.id] === "failed") {
@@ -616,15 +641,19 @@ function App() {
   }
 
   const renderTargets = renderTargetsFromMode(config.renderMode);
-  const activeStageCount = useMemo(() => stages.filter((stage) => isStageEnabled(stage, config.renderMode)).length, [config.renderMode]);
+  const activeStages = useMemo(
+    () => stages.filter((stage) => isStageEnabled(stage, config.renderMode, config.pipelineMode)),
+    [config.renderMode, config.pipelineMode],
+  );
+  const activeStageCount = activeStages.length;
   const completedCount = useMemo(
-    () => stages.filter((stage) => isStageEnabled(stage, config.renderMode) && stageStates[stage.id] === "done").length,
-    [config.renderMode, stageStates],
+    () => activeStages.filter((stage) => stageStates[stage.id] === "done").length,
+    [activeStages, stageStates],
   );
   const progressUnits = useMemo(
     () =>
       stages.reduce((sum, stage) => {
-        if (!isStageEnabled(stage, config.renderMode)) {
+        if (!isStageEnabled(stage, config.renderMode, config.pipelineMode)) {
           return sum;
         }
         if (stageStates[stage.id] === "done") {
@@ -635,15 +664,16 @@ function App() {
         }
         return sum;
       }, 0),
-    [config.renderMode, stageProgress, stageStates],
+    [config.renderMode, config.pipelineMode, stageProgress, stageStates],
   );
-  const progress = Math.round((progressUnits / activeStageCount) * 100);
+  const progress = Math.round((progressUnits / Math.max(1, activeStageCount)) * 100);
   const canStart = config.refVideoPath && config.moviePath && !isRunning;
 
   const videoOutputFullPath = outputPath(config.outputRoot, "outputs/8_generate_video");
   const jianyingDraftFullPath = config.jianyingDraftDir
     ? config.jianyingDraftDir
     : outputPath(config.outputRoot, "outputs/8_generate_video/jianying_drafts");
+  const isRefAudioRebuild = config.pipelineMode === "ref_audio_rebuild";
 
   return (
     <div className="app-shell">
@@ -792,6 +822,32 @@ function App() {
                   <h2>输出目标</h2>
                 </div>
               </div>
+              <div className="render-options pipeline-mode-options">
+                <label className={cx("check-option", config.pipelineMode === "clone" && "active")}>
+                  <input
+                    type="radio"
+                    name="pipelineMode"
+                    checked={config.pipelineMode === "clone"}
+                    onChange={() => updateConfig("pipelineMode", "clone")}
+                  />
+                  <span>
+                    <strong>仿写克隆</strong>
+                    <small>重写文案并生成新解说视频</small>
+                  </span>
+                </label>
+                <label className={cx("check-option", isRefAudioRebuild && "active")}>
+                  <input
+                    type="radio"
+                    name="pipelineMode"
+                    checked={isRefAudioRebuild}
+                    onChange={() => updateConfig("pipelineMode", "ref_audio_rebuild")}
+                  />
+                  <span>
+                    <strong>参考音频画面重组</strong>
+                    <small>保留参考原声并替换为原片画面</small>
+                  </span>
+                </label>
+              </div>
               <div className="render-options">
                 <label className={cx("check-option", renderTargets.outputVideo && "active")}>
                   <input
@@ -885,6 +941,7 @@ function App() {
               )}
             </div>
 
+            {!isRefAudioRebuild && (
             <div className="panel">
               <div className="panel-heading compact">
                 <div>
@@ -924,18 +981,21 @@ function App() {
                 </div>
               </div>
             </div>
+            )}
 
             <div className="panel wide-panel">
               <div className="panel-heading">
                 <div>
                   <p className="section-label">高级参数</p>
-                  <h2>性能、镜头识别与配音</h2>
+                  <h2>{isRefAudioRebuild ? "性能与镜头识别" : "性能、镜头识别与配音"}</h2>
                 </div>
               </div>
               <div className="settings-grid">
                 <SelectField label="镜头后端" value={config.backend} onChange={(value) => updateConfig("backend", value as BackendMode)} options={["auto", "transnet", "opencv"]} />
                 <SelectField label="视频编码" value={config.videoEncoder} onChange={(value) => updateConfig("videoEncoder", value as VideoEncoder)} options={["auto", "libx264", "h264_nvenc"]} />
                 <NumberField label="镜头阈值" value={config.threshold} min={0.1} max={0.9} step={0.05} onChange={(value) => updateConfig("threshold", value)} />
+                {!isRefAudioRebuild && (
+                  <>
                 <NumberField label="AI 温度" value={config.aiTemperature} min={0} max={1.5} step={0.1} onChange={(value) => updateConfig("aiTemperature", value)} />
                 <NumberField label="每秒字数" value={config.charsPerSecond} min={2} max={8} step={0.1} onChange={(value) => updateConfig("charsPerSecond", value)} />
                 <NumberField label="配音速度" value={config.edgeTtsSpeed} min={0.5} max={2} step={0.05} onChange={(value) => updateConfig("edgeTtsSpeed", value)} />
@@ -943,6 +1003,8 @@ function App() {
                   Edge Voice ID
                   <input value={config.edgeVoiceId} onChange={(event) => updateConfig("edgeVoiceId", event.target.value)} />
                 </label>
+                  </>
+                )}
               </div>
             </div>
           </section>
@@ -951,7 +1013,7 @@ function App() {
         {activeTab === "pipeline" && (
           <section className="pipeline-layout">
             <div className="stage-list">
-              {stages.map((stage) => (
+              {activeStages.map((stage) => (
                 <StageRow
                   key={stage.id}
                   stage={stage}
