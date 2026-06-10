@@ -557,8 +557,29 @@ def _concat_videos(
     return out_path
 
 
-def _concat_clips_filter(paths: list[Path], out_path: Path, *, encoder: str, has_audio: bool) -> Path:
-    """用 filter concat 重编码拼接，比 concat demuxer 更不易产生音频爆音。"""
+_WIN_CMD_MAX = 7500
+
+
+def _estimate_filter_concat_cmd_len(paths: list[Path], *, has_audio: bool) -> int:
+    if not paths:
+        return 0
+    path_len = max(len(str(p.resolve())) for p in paths)
+    per_input = path_len + 4
+    per_stream = 24 if has_audio else 12
+    return 400 + len(paths) * (per_input + per_stream)
+
+
+def _filter_concat_batch_size(paths: list[Path], *, has_audio: bool) -> int:
+    if not paths:
+        return 1
+    path_len = max(len(str(p.resolve())) for p in paths)
+    per_input = path_len + 4
+    per_stream = 24 if has_audio else 12
+    size = (_WIN_CMD_MAX - 400) // (per_input + per_stream)
+    return max(2, min(size, 100))
+
+
+def _concat_clips_filter_once(paths: list[Path], out_path: Path, *, encoder: str, has_audio: bool) -> Path:
     n = len(paths)
     inputs: list[str] = [resolve_ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y"]
     for path in paths:
@@ -598,6 +619,54 @@ def _concat_clips_filter(paths: list[Path], out_path: Path, *, encoder: str, has
         ]
     run_ffmpeg(cmd)
     return out_path
+
+
+def _concat_clips_filter_batched(
+    paths: list[Path],
+    out_path: Path,
+    *,
+    encoder: str,
+    has_audio: bool,
+    batch_size: int,
+) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    batch_dir = out_path.parent / f".concat_batches_{uuid.uuid4().hex[:8]}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        current = list(paths)
+        level = 0
+        while len(current) > 1:
+            if os.name != "nt" or _estimate_filter_concat_cmd_len(current, has_audio=has_audio) <= _WIN_CMD_MAX:
+                _concat_clips_filter_once(current, out_path, encoder=encoder, has_audio=has_audio)
+                return out_path
+
+            next_level: list[Path] = []
+            for batch_idx in range(0, len(current), batch_size):
+                batch = current[batch_idx : batch_idx + batch_size]
+                if len(batch) == 1:
+                    next_level.append(batch[0])
+                    continue
+                batch_out = batch_dir / f"L{level:02d}_{batch_idx // batch_size:04d}.mp4"
+                _concat_clips_filter_once(batch, batch_out, encoder=encoder, has_audio=has_audio)
+                next_level.append(batch_out)
+            current = next_level
+            level += 1
+
+        if len(current) == 1:
+            shutil.copy2(current[0], out_path)
+        return out_path
+    finally:
+        shutil.rmtree(batch_dir, ignore_errors=True)
+
+
+def _concat_clips_filter(paths: list[Path], out_path: Path, *, encoder: str, has_audio: bool) -> Path:
+    """用 filter concat 重编码拼接，比 concat demuxer 更不易产生音频爆音。
+    片段过多时自动分批拼接，避免 Windows 命令行长度超限 (WinError 206)。
+    """
+    if os.name == "nt" and _estimate_filter_concat_cmd_len(paths, has_audio=has_audio) > _WIN_CMD_MAX:
+        batch_size = _filter_concat_batch_size(paths, has_audio=has_audio)
+        return _concat_clips_filter_batched(paths, out_path, encoder=encoder, has_audio=has_audio, batch_size=batch_size)
+    return _concat_clips_filter_once(paths, out_path, encoder=encoder, has_audio=has_audio)
 
 
 def _mux_item_with_audio(visual_path: Path, audio_path: Path, out_path: Path, duration: float, *, encoder: str) -> Path:
