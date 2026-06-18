@@ -6,7 +6,7 @@ import os
 import time
 import threading
 import subprocess
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 try:
     from clone_narration_video.utils.ffmpeg_utils import get_ffmpeg_cuda_prefix, resolve_ffmpeg_bin
@@ -22,14 +22,161 @@ class _TorchNetNotAvailable(RuntimeError):
     pass
 
 
-def _import_torch():
+def _format_torch_import_error(exc: BaseException) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    if os.name != "nt":
+        return message
+    lowered = message.lower()
+    if "1114" in message or "c10.dll" in lowered or "dll" in lowered:
+        message += (
+            "。常见原因：1) NVIDIA 驱动过旧，无法加载打包的 CUDA PyTorch"
+            "（cu128 需驱动≥570，cu124 需≥550，cu121 需≥530）；"
+            "2) 缺少 VC++ 2015-2022 运行库。"
+            "请更新显卡驱动后重试，或重新打包为 cu124/cu121/cpu 版 PyTorch。"
+        )
+    return message
+
+
+def _torch_site_candidates() -> list[tuple[str, str | None]]:
+    import sys
+    from pathlib import Path
+
+    candidates: list[tuple[str, str | None]] = [("primary", None)]
+    seen: set[str] = set()
+
+    env_root = os.environ.get("TORCH_FALLBACK_ROOT", "").strip()
+    if env_root:
+        for tag in ("cu128", "cu124", "cu121"):
+            fallback = Path(env_root) / tag / "Lib" / "site-packages"
+            if fallback.is_dir():
+                key = str(fallback)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append((f"{tag}-fallback", key))
+
+    for entry in sys.path:
+        entry_path = Path(entry)
+        if entry_path.name != "site-packages":
+            continue
+        python_root = entry_path.parent.parent
+        for tag in ("cu128", "cu124", "cu121"):
+            fallback = python_root / "torch_fallbacks" / tag / "Lib" / "site-packages"
+            if fallback.is_dir():
+                key = str(fallback)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append((f"{tag}-fallback", key))
+        break
+
+    return candidates
+
+
+def _purge_torch_modules() -> None:
+    import sys
+
+    for name in list(sys.modules):
+        if name == "torch" or name.startswith("torch."):
+            del sys.modules[name]
+
+
+def _prepare_windows_torch_dll_path(extra_sites: list[str] | None = None) -> None:
+    import sys
+
+    candidates: list[str] = []
+    sites = list(extra_sites or []) + list(sys.path)
+    for site in sites:
+        if not site:
+            continue
+        lib = os.path.join(site, "torch", "lib")
+        if os.path.isdir(lib):
+            candidates.append(lib)
+    if not candidates:
+        return
+    for lib in candidates:
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(lib)
+    prefix = os.pathsep.join(dict.fromkeys(candidates))
+    current = os.environ.get("PATH", "")
+    if not current.startswith(prefix):
+        os.environ["PATH"] = f"{prefix}{os.pathsep}{current}" if current else prefix
+
+
+def _load_torch_modules(label: str, site_path: str | None):
+    import sys
+
+    _purge_torch_modules()
+    inserted = False
+    if site_path:
+        sys.path.insert(0, site_path)
+        inserted = True
     try:
+        if os.name == "nt":
+            _prepare_windows_torch_dll_path([site_path] if site_path else None)
         import torch  # type: ignore
         import torch.nn as nn  # type: ignore
         import torch.nn.functional as functional  # type: ignore
-    except Exception as e:
-        raise _TorchNetNotAvailable(str(e))
-    return torch, nn, functional
+        return torch, nn, functional
+    finally:
+        if inserted and site_path and site_path in sys.path:
+            sys.path.remove(site_path)
+
+
+def _cuda_failure_detail(torch_mod: Any, exc: BaseException) -> str:
+    parts = [_error_summary(exc)]
+    try:
+        if torch_mod.cuda.is_available() and torch_mod.cuda.device_count() > 0:
+            cap = torch_mod.cuda.get_device_capability(0)
+            parts.append(f"GPU={torch_mod.cuda.get_device_name(0)} sm_{cap[0]}{cap[1]}")
+    except Exception:
+        pass
+    return "; ".join(parts)
+
+
+def _cuda_usable_with(torch_mod: Any, label: str) -> bool:
+    if not torch_mod.cuda.is_available():
+        return False
+    try:
+        torch_mod.zeros(1, device="cuda")
+        if torch_mod.cuda.device_count() > 0:
+            cap = torch_mod.cuda.get_device_capability(0)
+            logger.info(
+                "[TransNetV2] CUDA ok with torch %s (%s, %s sm_%d%d)",
+                torch_mod.__version__,
+                label,
+                torch_mod.cuda.get_device_name(0),
+                cap[0],
+                cap[1],
+            )
+        return True
+    except Exception as exc:
+        logger.warning("[TransNetV2] %s CUDA 不可用: %s", label, _cuda_failure_detail(torch_mod, exc))
+        return False
+
+
+def _import_torch():
+    errors: list[str] = []
+    imported: list[tuple[Any, Any, Any, str]] = []
+
+    for label, site in _torch_site_candidates():
+        try:
+            torch_mod, nn_mod, functional_mod = _load_torch_modules(label, site)
+        except Exception as exc:
+            errors.append(f"{label}: {_format_torch_import_error(exc)}")
+            continue
+        if _cuda_usable_with(torch_mod, label):
+            return torch_mod, nn_mod, functional_mod
+        imported.append((torch_mod, nn_mod, functional_mod, label))
+
+    if imported:
+        torch_mod, nn_mod, functional_mod, label = imported[0]
+        logger.warning(
+            "[TransNetV2] 无可用 CUDA PyTorch，使用 CPU (%s %s)",
+            torch_mod.__version__,
+            label,
+        )
+        return torch_mod, nn_mod, functional_mod
+
+    raise _TorchNetNotAvailable("; ".join(errors) or "no torch installation found")
 
 
 torch, nn, functional = _import_torch()
@@ -359,19 +506,19 @@ import random
 
 
 def _cuda_usable() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        torch.zeros(1, device="cuda")
-        return True
-    except Exception:
-        logger.warning("[TransNetV2] CUDA 不可用或与当前 PyTorch 不兼容，回退 CPU")
-        return False
+    return _cuda_usable_with(torch, "active")
+
+
+def _error_summary(error: BaseException) -> str:
+    message = str(error).strip() or error.__class__.__name__
+    return message[:500]
 
 
 class TransNetV2Torch:
     def __init__(self, model_dir: str, device: Optional[str] = None):
         self._device = self._resolve_device(device)
+        self._device_fallback_reason: Optional[str] = None
+        self._last_timings: dict[str, float] = {}
         self._lock = threading.Lock()
         self._model = _TransNetV2Net()
 
@@ -388,7 +535,7 @@ class TransNetV2Torch:
             state = state["state_dict"]
         self._model.load_state_dict(state)
         self._model.eval()
-        self._model.to(self._device)
+        self._move_model_to_device(self._device)
 
     def _resolve_device(self, device: Optional[str]) -> torch.device:
         raw = str(device or os.environ.get("TRANSNETV2_DEVICE") or "auto").strip().lower()
@@ -401,8 +548,41 @@ class TransNetV2Torch:
         except Exception:
             return torch.device("cuda") if _cuda_usable() else torch.device("cpu")
 
+    def _move_model_to_device(self, device: torch.device) -> None:
+        try:
+            self._model.to(device)
+        except Exception as exc:
+            if device.type != "cuda":
+                raise
+            self._fallback_to_cpu(exc)
+
+    def _fallback_to_cpu(self, error: BaseException) -> None:
+        reason = _error_summary(error)
+        logger.warning("[TransNetV2] CUDA failed; falling back to CPU: %s", reason)
+        self._device = torch.device("cpu")
+        self._device_fallback_reason = reason
+        self._model.to(self._device)
+
     def get_backend_info(self) -> dict:
-        return {"backend": "torch", "device": str(self._device)}
+        info = {
+            "backend": "torch",
+            "device": str(self._device),
+            "torch_version": str(torch.__version__),
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_version": str(torch.version.cuda or ""),
+        }
+        if self._device.type == "cuda":
+            try:
+                info["device_name"] = str(torch.cuda.get_device_name(self._device))
+            except Exception:
+                pass
+        if self._device_fallback_reason:
+            info["device_fallback"] = "cpu"
+            info["device_fallback_reason"] = self._device_fallback_reason
+        last_timings = getattr(self, "_last_timings", None)
+        if last_timings:
+            info["timings"] = dict(last_timings)
+        return info
 
     def predict_raw(self, frames: np.ndarray):
         if not isinstance(frames, np.ndarray):
@@ -412,12 +592,21 @@ class TransNetV2Torch:
         if len(frames.shape) != 5 or list(frames.shape[2:]) != [27, 48, 3]:
             raise ValueError("frames shape must be [B, T, 27, 48, 3]")
 
+        try:
+            return self._predict_raw_on_current_device(frames)
+        except Exception as exc:
+            if self._device.type != "cuda":
+                raise
+            self._fallback_to_cpu(exc)
+            return self._predict_raw_on_current_device(frames)
+
+    def _predict_raw_on_current_device(self, frames: np.ndarray):
         x = torch.from_numpy(frames)
         if not x.is_contiguous():
             x = x.contiguous()
         x = x.to(device=self._device, non_blocking=True)
         with self._lock:
-            with torch.no_grad():
+            with torch.inference_mode():
                 out = self._model(x)
 
         if isinstance(out, tuple):
@@ -453,7 +642,8 @@ class TransNetV2Torch:
             [start_frame] * no_padded_frames_start + [frames] + [end_frame] * no_padded_frames_end, 0
         )
 
-        batch = max(1, int(os.environ.get("TRANSNETV2_TORCH_BATCH") or 4))
+        default_batch = 8 if self._device.type == "cpu" else 4
+        batch = max(1, int(os.environ.get("TRANSNETV2_TORCH_BATCH") or default_batch))
         preds_single = []
         preds_all = []
         window = 0
@@ -500,6 +690,7 @@ class TransNetV2Torch:
             progress_callback(1.0)
 
         ffmpeg_bin = resolve_ffmpeg_bin()
+        decode_started = time.perf_counter()
 
         def _build_cmd(hwaccel_prefix: tuple[str, ...] = ()):
             cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin", *hwaccel_prefix]
@@ -586,13 +777,20 @@ class TransNetV2Torch:
                 raise RuntimeError(msg or "ffmpeg_extract_failed")
 
         video = np.frombuffer(out, np.uint8).reshape([-1, 27, 48, 3])
+        decode_seconds = time.perf_counter() - decode_started
 
         def wrapped_callback(pct: float):
             if progress_callback:
                 final_pct = 10.0 + (pct * 0.9)
                 progress_callback(final_pct)
 
-        return (video, *self.predict_frames(video, progress_callback=wrapped_callback))
+        inference_started = time.perf_counter()
+        predictions = self.predict_frames(video, progress_callback=wrapped_callback)
+        self._last_timings = {
+            "decode_seconds": round(decode_seconds, 3),
+            "inference_seconds": round(time.perf_counter() - inference_started, 3),
+        }
+        return (video, *predictions)
 
     @staticmethod
     def predictions_to_scenes(predictions: np.ndarray, threshold: float = 0.5):

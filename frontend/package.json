@@ -9,8 +9,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "electron": "electron .",
-    "dist": "npm run build && electron-builder --win nsis --x64",
-    "pack:dir": "npm run build && electron-builder --win dir --x64"
+    "dist": "powershell -ExecutionPolicy Bypass -File scripts/prepare-dist.ps1 -Target nsis",
+    "pack:dir": "powershell -ExecutionPolicy Bypass -File scripts/prepare-dist.ps1 -Target dir"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
@@ -50,6 +50,10 @@
         "to": "backend/requirements.txt"
       },
       {
+        "from": "../__init__.py",
+        "to": "backend/__init__.py"
+      },
+      {
         "from": "../1_reference_analyzer",
         "to": "backend/1_reference_analyzer"
       },
@@ -66,8 +70,20 @@
         "to": "backend/4_visual_alignment_engine"
       },
       {
+        "from": "../4.1_ref_audio_rebuild_composer",
+        "to": "backend/4.1_ref_audio_rebuild_composer"
+      },
+      {
         "from": "../5_script_visual_binder",
         "to": "backend/5_script_visual_binder"
+      },
+      {
+        "from": "../5.1_movie_subtitle_filler",
+        "to": "backend/5.1_movie_subtitle_filler"
+      },
+      {
+        "from": "../5.2_audio_role_classifier",
+        "to": "backend/5.2_audio_role_classifier"
       },
       {
         "from": "../6_rewrite_engine",
@@ -88,6 +104,25 @@
       {
         "from": "../model",
         "to": "backend/model"
+      },
+      {
+        "from": "../portable-python",
+        "to": "backend/python",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/*.pyo"
+        ]
+      },
+      {
+        "from": "../ffmpeg/bin",
+        "to": "backend/ffmpeg/bin",
+        "filter": [
+          "ffmpeg.exe",
+          "ffprobe.exe",
+          "ffplay.exe"
+        ]
       }
     ],
     "win": {

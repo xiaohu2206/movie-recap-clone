@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import os
 import re
@@ -19,14 +20,10 @@ from utils.cli_bootstrap import add_project_to_syspath
 add_project_to_syspath()
 
 from clone_narration_video.utils.ffmpeg_utils import probe_duration, ffprobe_json, resolve_ffmpeg_bin, run_ffmpeg
-from clone_narration_video.utils.generate_video_audio_modes import (
-    audio_mode_for_item,
-    is_original_audio_item,
-    original_audio_result,
-)
 from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir, relpath, resolve_existing_path
+from clone_narration_video.utils.shot_breakdown import build_shot_breakdown
 from clone_narration_video.utils.tts.edge.edge_tts_service import edge_tts_service
 
 
@@ -179,14 +176,6 @@ def _video_codec_args(encoder: str) -> list[str]:
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
 
 
-def _audio_codec_args() -> list[str]:
-    return ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
-
-
-def _audio_pts_filter() -> str:
-    return "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
-
-
 def _item_duration_from_clips(item: dict[str, Any]) -> float:
     total = 0.0
     for clip in item.get("video_clips") or []:
@@ -197,6 +186,201 @@ def _item_duration_from_clips(item: dict[str, Any]) -> float:
         except Exception:
             pass
     return _round(total)
+
+
+def _is_original_audio_item(item: dict[str, Any], audio: dict[str, Any] | None = None) -> bool:
+    if audio and audio.get("use_original_audio") is True:
+        return True
+    return str(item.get("audio_type") or "").lower() == "original_audio" or item.get("keep_original_audio") is True
+
+
+def _is_reference_audio_item(item: dict[str, Any]) -> bool:
+    return str(item.get("audio_type") or "").lower() == "reference_audio" or isinstance(item.get("external_audio"), dict)
+
+
+def _needs_edge_tts(items: list[dict[str, Any]]) -> bool:
+    for item in items:
+        if _is_original_audio_item(item) or _is_reference_audio_item(item):
+            continue
+        if str(item.get("narration") or "").strip():
+            return True
+    return False
+
+
+def _ensure_edge_tts_available(items: list[dict[str, Any]]) -> None:
+    if not _needs_edge_tts(items):
+        return
+    if importlib.util.find_spec("edge_tts") is not None:
+        return
+    raise RuntimeError(
+        "edge-tts is required for narration TTS but is not installed in the active Python environment.\n"
+        f"Python: {sys.executable}\n"
+        "Install dependencies with: python -m pip install -r requirements.txt\n"
+        "Or run with the project venv: .\\.venv\\Scripts\\python.exe .\\8_generate_video\\run.py ..."
+    )
+
+
+def _valid_cached_audio_duration(out_path: Path) -> float:
+    """校验缓存音频是否可用，返回有效时长；损坏/空文件会被删除并返回 0。"""
+    if not out_path.exists() or out_path.stat().st_size <= 0:
+        return 0.0
+    try:
+        duration = probe_duration(out_path)
+    except Exception:
+        duration = 0.0
+    if duration <= 0:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+        return 0.0
+    return duration
+
+
+def _cut_external_audio(item: dict[str, Any], out_path: Path, *, reuse: bool) -> dict[str, Any]:
+    external = item.get("external_audio") or {}
+    if not isinstance(external, dict):
+        raise ValueError("reference_audio item 缺少 external_audio")
+
+    source = _source_path(str(external.get("path") or ""))
+    start = max(0.0, float(external.get("start") or 0.0))
+    end = external.get("end")
+    expected_duration = float(external.get("duration") or 0.0)
+    if expected_duration <= 0 and end is not None:
+        expected_duration = max(0.0, float(end) - start)
+    if expected_duration <= 0:
+        expected_duration = max(_item_duration_from_clips(item), 0.3)
+
+    if reuse:
+        cached = _valid_cached_audio_duration(out_path)
+        if cached > 0:
+            return {"path": str(out_path), "duration": _round(cached), "source": "reference_audio", "reused": True}
+
+    run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{max(0.03, expected_duration):.3f}",
+            "-i",
+            str(source),
+            "-vn",
+            "-map",
+            "0:a:0?",
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "3",
+            "-ar",
+            "48000",
+            str(out_path),
+        ]
+    )
+    duration = probe_duration(out_path) or expected_duration
+    return {
+        "path": str(out_path),
+        "duration": _round(duration),
+        "source": "reference_audio",
+        "source_path": str(source),
+        "source_start": _round(start),
+    }
+
+
+def _fade_duration(total: float) -> float:
+    return min(0.025, max(0.008, total / 5))
+
+
+def _trim_tts_audio(input_path: Path, output_path: Path) -> bool:
+    """仅裁掉 TTS 开头静音。尾部/句内停顿不能裁，否则会截断配音或产生爆音。"""
+    if not input_path.exists() or input_path.stat().st_size <= 0:
+        return False
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    af = (
+        "silenceremove="
+        "detection=rms:start_periods=1:start_duration=0.05:start_threshold=-45dB:"
+        "start_silence=0.08:stop_periods=0"
+    )
+    proc = run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(input_path),
+            "-af",
+            af,
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "2",
+            str(output_path),
+        ],
+        check=False,
+    )
+    if proc.returncode != 0 or not output_path.exists() or output_path.stat().st_size <= 0:
+        output_path.unlink(missing_ok=True)
+        return False
+    try:
+        duration = probe_duration(output_path)
+    except Exception:
+        duration = 0.0
+    if duration <= 0.03:
+        output_path.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _apply_item_audio_boundary_fades(path: Path, *, encoder: str) -> Path:
+    """在片段首尾加短淡入淡出，减轻 narration / 原声切换时的爆音。"""
+    duration = probe_duration(path)
+    if duration <= 0.03:
+        return path
+    fade_d = _fade_duration(duration)
+    fade_out = max(0.0, duration - fade_d)
+    tmp = path.with_name(f"{path.stem}_fade{path.suffix}")
+    run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(path),
+            "-filter_complex",
+            (
+                f"[0:a]aresample=48000,afade=t=in:st=0:d={fade_d:.4f},"
+                f"afade=t=out:st={fade_out:.4f}:d={fade_d:.4f}[a]"
+            ),
+            "-map",
+            "0:v:0",
+            "-map",
+            "[a]",
+            *_video_codec_args(encoder),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-movflags",
+            "+faststart",
+            str(tmp),
+        ]
+    )
+    shutil.move(tmp, path)
+    return path
 
 
 def _retime_clips_to_audio(item: dict[str, Any], target_duration: float) -> list[dict[str, Any]]:
@@ -243,13 +427,17 @@ async def _synthesize_one(
     proxy: str | None,
     reuse: bool,
 ) -> dict[str, Any]:
-    if is_original_audio_item(item):
-        return original_audio_result(item)
-
     item_id = str(item.get("item_id") or item.get("segment_id") or uuid.uuid4().hex[:8])
     narration = str(item.get("narration") or "").strip()
     out_path = audio_dir / f"{_safe_name(item_id, 'item')}.mp3"
     audio_dir.mkdir(parents=True, exist_ok=True)
+
+    if _is_original_audio_item(item):
+        duration = max(_item_duration_from_clips(item), float(item.get("tts_duration") or 0.0), 0.3)
+        return {"path": "", "duration": _round(duration), "use_original_audio": True}
+
+    if _is_reference_audio_item(item):
+        return _cut_external_audio(item, out_path, reuse=reuse)
 
     if not narration:
         duration = max(float(item.get("tts_duration") or 0.0), _item_duration_from_clips(item), 0.3)
@@ -275,8 +463,10 @@ async def _synthesize_one(
         )
         return {"path": str(out_path), "duration": probe_duration(out_path), "silent": True}
 
-    if reuse and out_path.exists() and out_path.stat().st_size > 0:
-        return {"path": str(out_path), "duration": probe_duration(out_path), "reused": True}
+    if reuse:
+        cached = _valid_cached_audio_duration(out_path)
+        if cached > 0:
+            return {"path": str(out_path), "duration": _round(cached), "reused": True}
 
     result = await edge_tts_service.synthesize(
         narration,
@@ -285,9 +475,13 @@ async def _synthesize_one(
         out_path=out_path,
         proxy_override=proxy,
     )
+    await asyncio.sleep(0.1)
     if not result.get("success"):
         raise RuntimeError(f"Edge TTS 合成失败 {item_id}: {result.get('error') or result.get('message')}")
-    duration = float(result.get("duration") or 0.0) or probe_duration(out_path)
+    trim_path = out_path.with_name(f"{out_path.stem}_trim{out_path.suffix}")
+    if _trim_tts_audio(out_path, trim_path):
+        shutil.move(trim_path, out_path)
+    duration = probe_duration(out_path)
     if duration <= 0:
         raise RuntimeError(f"无法读取配音时长: {out_path}")
     return {"path": str(out_path), "duration": _round(duration), "voice_id": voice_id}
@@ -322,8 +516,7 @@ async def synthesize_timeline_audio(
                 proxy=proxy,
                 reuse=reuse,
             )
-            label = "original" if result.get("original_audio") else "tts"
-            print(f"[{label}] {key} {result['duration']:.3f}s")
+            print(f"[tts] {key} {result['duration']:.3f}s")
             async with lock:
                 completed += 1
                 if progress_callback:
@@ -334,60 +527,104 @@ async def synthesize_timeline_audio(
     return dict(pairs)
 
 
-def _cut_video_clip(
-    source: Path,
-    start: float,
-    duration: float,
-    out_path: Path,
-    *,
-    encoder: str,
-    keep_audio: bool = False,
-    audio_volume: float = 1.0,
-) -> Path:
+def _cut_video_clip(source: Path, start: float, duration: float, out_path: Path, *, encoder: str, keep_audio: bool = False) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    seek = f"{max(0.0, start):.3f}"
+    take = f"{max(0.03, duration):.3f}"
     cmd = [
         resolve_ffmpeg_bin(),
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
-        "-ss",
-        f"{max(0.0, start):.3f}",
-        "-t",
-        f"{max(0.03, duration):.3f}",
-        "-i",
-        str(source),
-        "-map",
-        "0:v:0",
     ]
+    # 保留原声时必须精确 seek，避免每个 clip 起点爆音
+    if keep_audio:
+        cmd += ["-i", str(source), "-ss", seek, "-t", take]
+    else:
+        cmd += ["-ss", seek, "-t", take, "-i", str(source)]
+    cmd += ["-map", "0:v:0"]
     if keep_audio:
         cmd += [
             "-map",
-            "0:a?",
+            "0:a:0?",
             "-vf",
             "setsar=1,format=yuv420p",
             *_video_codec_args(encoder),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
         ]
-        if audio_volume != 1.0:
-            cmd += ["-af", f"volume={max(0.0, float(audio_volume)):.3f},{_audio_pts_filter()}"]
-        else:
-            cmd += ["-af", _audio_pts_filter()]
-        cmd += [*_audio_codec_args(), "-movflags", "+faststart"]
     else:
         cmd += [
-            "-an",
+            "-map",
+            "-0:a",
             "-vf",
             "setsar=1,format=yuv420p",
             *_video_codec_args(encoder),
-            "-movflags",
-            "+faststart",
         ]
     cmd.append(str(out_path))
     run_ffmpeg(cmd)
     return out_path
 
 
-def _concat_videos(paths: list[Path], out_path: Path, *, reencode: bool = False, encoder: str = "auto") -> Path:
+def _first_clip_video_meta(items: list[dict[str, Any]]) -> dict[str, Any]:
+    for item in items:
+        for clip in item.get("video_clips") or []:
+            if not isinstance(clip, dict):
+                continue
+            source = str(clip.get("source") or "").strip()
+            if source:
+                return _probe_video_meta(_source_path(source))
+    return {"width": 1920, "height": 1080, "fps": 30.0, "duration": 0.0}
+
+
+def _make_blank_video(duration: float, out_path: Path, *, encoder: str, meta: dict[str, Any]) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    width = max(2, int(meta.get("width") or 1920) // 2 * 2)
+    height = max(2, int(meta.get("height") or 1080) // 2 * 2)
+    fps = float(meta.get("fps") or 30.0)
+    if fps <= 0:
+        fps = 30.0
+    run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s={width}x{height}:r={fps:.3f}:d={max(0.03, duration):.3f}",
+            "-an",
+            *_video_codec_args(encoder),
+            str(out_path),
+        ]
+    )
+    return out_path
+
+
+def _nearest_video_clip(items: list[dict[str, Any]], item_index: int) -> dict[str, Any] | None:
+    for scan_range in (range(item_index + 1, len(items)), range(item_index - 1, -1, -1)):
+        for idx in scan_range:
+            for clip in items[idx].get("video_clips") or []:
+                if isinstance(clip, dict) and str(clip.get("source") or "").strip():
+                    return dict(clip)
+    return None
+
+
+def _concat_videos(
+    paths: list[Path],
+    out_path: Path,
+    *,
+    reencode: bool = False,
+    encoder: str = "auto",
+    has_audio: bool = False,
+) -> Path:
     if not paths:
         raise ValueError("没有可拼接的视频片段")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -395,48 +632,171 @@ def _concat_videos(paths: list[Path], out_path: Path, *, reencode: bool = False,
         shutil.copy2(paths[0], out_path)
         return out_path
 
+    if reencode:
+        return _concat_clips_filter(paths, out_path, encoder=encoder, has_audio=has_audio)
+
     list_path = out_path.with_suffix(".concat.txt")
     list_path.write_text(
         "\n".join(f"file '{_quote_concat_path(p)}'" for p in paths),
         encoding="utf-8",
     )
-    cmd = [
-        resolve_ffmpeg_bin(),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-fflags",
-        "+genpts",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(list_path),
+    run_ffmpeg(
+        [
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c",
+            "copy",
+            str(out_path),
+        ]
+    )
+    return out_path
+
+
+_WIN_CMD_MAX = 7500
+
+
+def _estimate_filter_concat_cmd_len(paths: list[Path], *, has_audio: bool) -> int:
+    if not paths:
+        return 0
+    path_len = max(len(str(p.resolve())) for p in paths)
+    per_input = path_len + 4
+    per_stream = 280 if has_audio else 170
+    return 400 + len(paths) * (per_input + per_stream)
+
+
+def _filter_concat_batch_size(paths: list[Path], *, has_audio: bool) -> int:
+    if not paths:
+        return 1
+    path_len = max(len(str(p.resolve())) for p in paths)
+    per_input = path_len + 4
+    per_stream = 280 if has_audio else 170
+    size = (_WIN_CMD_MAX - 400) // (per_input + per_stream)
+    return max(2, min(size, 100))
+
+
+def _concat_clips_filter_once(paths: list[Path], out_path: Path, *, encoder: str, has_audio: bool) -> Path:
+    n = len(paths)
+    target_meta = _probe_video_meta(paths[0])
+    target_width = max(2, int(target_meta["width"]) // 2 * 2)
+    target_height = max(2, int(target_meta["height"]) // 2 * 2)
+    inputs: list[str] = [resolve_ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y"]
+    for path in paths:
+        inputs.extend(["-i", str(path)])
+
+    video_filters = [
+        (
+            f"[{i}:v:0]scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,setpts=PTS-STARTPTS,format=yuv420p[v{i}]"
+        )
+        for i in range(n)
     ]
-    if reencode:
-        cmd += [
-            "-vf",
-            "setsar=1,format=yuv420p",
+    if has_audio:
+        audio_filters = [
+            (
+                f"[{i}:a:0]aresample=48000,"
+                f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                f"asetpts=PTS-STARTPTS[a{i}]"
+            )
+            for i in range(n)
+        ]
+        streams = "".join(f"[v{i}][a{i}]" for i in range(n))
+        fc = ";".join(video_filters + audio_filters + [f"{streams}concat=n={n}:v=1:a=1[v][a]"])
+        cmd = inputs + [
+            "-filter_complex",
+            fc,
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
             *_video_codec_args(encoder),
-            "-af",
-            _audio_pts_filter(),
-            *_audio_codec_args(),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
             "-movflags",
             "+faststart",
+            str(out_path),
         ]
     else:
-        cmd += ["-c", "copy"]
-    cmd.append(str(out_path))
+        streams = "".join(f"[v{i}]" for i in range(n))
+        fc = ";".join(video_filters + [f"{streams}concat=n={n}:v=1:a=0[v]"])
+        cmd = inputs + [
+            "-filter_complex",
+            fc,
+            "-map",
+            "[v]",
+            *_video_codec_args(encoder),
+            str(out_path),
+        ]
     run_ffmpeg(cmd)
     return out_path
+
+
+def _concat_clips_filter_batched(
+    paths: list[Path],
+    out_path: Path,
+    *,
+    encoder: str,
+    has_audio: bool,
+    batch_size: int,
+) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    batch_dir = out_path.parent / f".concat_batches_{uuid.uuid4().hex[:8]}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        current = list(paths)
+        level = 0
+        while len(current) > 1:
+            if os.name != "nt" or _estimate_filter_concat_cmd_len(current, has_audio=has_audio) <= _WIN_CMD_MAX:
+                _concat_clips_filter_once(current, out_path, encoder=encoder, has_audio=has_audio)
+                return out_path
+
+            next_level: list[Path] = []
+            for batch_idx in range(0, len(current), batch_size):
+                batch = current[batch_idx : batch_idx + batch_size]
+                if len(batch) == 1:
+                    next_level.append(batch[0])
+                    continue
+                batch_out = batch_dir / f"L{level:02d}_{batch_idx // batch_size:04d}.mp4"
+                _concat_clips_filter_once(batch, batch_out, encoder=encoder, has_audio=has_audio)
+                next_level.append(batch_out)
+            current = next_level
+            level += 1
+
+        if len(current) == 1:
+            shutil.copy2(current[0], out_path)
+        return out_path
+    finally:
+        shutil.rmtree(batch_dir, ignore_errors=True)
+
+
+def _concat_clips_filter(paths: list[Path], out_path: Path, *, encoder: str, has_audio: bool) -> Path:
+    """用 filter concat 重编码拼接，比 concat demuxer 更不易产生音频爆音。
+    片段过多时自动分批拼接，避免 Windows 命令行长度超限 (WinError 206)。
+    """
+    if os.name == "nt" and _estimate_filter_concat_cmd_len(paths, has_audio=has_audio) > _WIN_CMD_MAX:
+        batch_size = _filter_concat_batch_size(paths, has_audio=has_audio)
+        return _concat_clips_filter_batched(paths, out_path, encoder=encoder, has_audio=has_audio, batch_size=batch_size)
+    return _concat_clips_filter_once(paths, out_path, encoder=encoder, has_audio=has_audio)
 
 
 def _mux_item_with_audio(visual_path: Path, audio_path: Path, out_path: Path, duration: float, *, encoder: str) -> Path:
     visual_duration = probe_duration(visual_path)
     pad = max(0.0, duration - visual_duration)
     vf = f"tpad=stop_mode=clone:stop_duration={pad:.3f},trim=duration={duration:.3f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p"
+    af = f"aresample=48000,aformat=sample_rates=48000:channel_layouts=mono,atrim=0:{duration:.3f},asetpts=PTS-STARTPTS"
     run_ffmpeg(
         [
             resolve_ffmpeg_bin(),
@@ -449,13 +809,18 @@ def _mux_item_with_audio(visual_path: Path, audio_path: Path, out_path: Path, du
             "-i",
             str(audio_path),
             "-filter_complex",
-            f"[0:v]{vf}[v];[1:a]atrim=0:{duration:.3f},{_audio_pts_filter()}[a]",
+            f"[0:v]{vf}[v];[1:a]{af}[a]",
             "-map",
             "[v]",
             "-map",
             "[a]",
             *_video_codec_args(encoder),
-            *_audio_codec_args(),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
             "-movflags",
             "+faststart",
             str(out_path),
@@ -479,23 +844,16 @@ def render_video(
     tmp_dir.mkdir(parents=True, exist_ok=True)
     item_paths: list[Path] = []
     selected_encoder = _select_video_encoder(encoder)
+    fallback_meta = _first_clip_video_meta(items)
     print(f"[video] encoder={selected_encoder}")
 
     total_items = len(items)
     for item_index, item in enumerate(items, start=1):
         key = str(item.get("item_id") or item.get("segment_id") or f"item_{item_index:03d}")
-        audio_mode = audio_mode_for_item(item)
-        if audio_mode == "original":
-            audio = audio_results.get(key) or original_audio_result(item)
-            audio_duration = _item_duration_from_clips(item)
-            clips = [c for c in (item.get("video_clips") or []) if isinstance(c, dict)]
-        else:
-            audio = audio_results[key]
-            audio_path = Path(str(audio["path"]))
-            audio_duration = float(audio["duration"])
-            clips = _retime_clips_to_audio(item, audio_duration)
-        if not clips:
-            raise ValueError(f"{key} 没有可用 video_clips")
+        audio = audio_results[key]
+        audio_duration = float(audio["duration"])
+        use_original_audio = _is_original_audio_item(item, audio)
+        clips = _retime_clips_to_audio(item, audio_duration)
 
         clip_paths: list[Path] = []
         for clip_index, clip in enumerate(clips, start=1):
@@ -504,32 +862,46 @@ def render_video(
             end = float(clip.get("movie_end") or 0.0)
             duration = max(0.03, end - start)
             clip_path = tmp_dir / f"{item_index:04d}_{clip_index:03d}.mp4"
-            _cut_video_clip(
-                source,
-                start,
-                duration,
-                clip_path,
-                encoder=selected_encoder,
-                keep_audio=audio_mode == "original",
-            )
+            _cut_video_clip(source, start, duration, clip_path, encoder=selected_encoder, keep_audio=use_original_audio)
             clip_paths.append(clip_path)
 
         item_path = tmp_dir / f"{item_index:04d}_narrated.mp4"
-        if audio_mode == "original":
-            _concat_videos(clip_paths, item_path, reencode=True, encoder=selected_encoder)
-        else:
-            visual_path = tmp_dir / f"{item_index:04d}_visual.mp4"
-            _concat_videos(clip_paths, visual_path)
+        if not clip_paths:
+            if use_original_audio:
+                raise ValueError(f"{key} 没有可用 video_clips")
+            audio_path = Path(str(audio["path"]))
+            visual_path = tmp_dir / f"{item_index:04d}_blank.mp4"
+            _make_blank_video(audio_duration, visual_path, encoder=selected_encoder, meta=fallback_meta)
             _mux_item_with_audio(visual_path, audio_path, item_path, audio_duration, encoder=selected_encoder)
+        elif use_original_audio:
+            _concat_videos(
+                clip_paths,
+                item_path,
+                reencode=True,
+                encoder=selected_encoder,
+                has_audio=True,
+            )
+        else:
+            audio_path = Path(str(audio["path"]))
+            visual_path = tmp_dir / f"{item_index:04d}_visual.mp4"
+            _concat_videos(
+                clip_paths,
+                visual_path,
+                reencode=True,
+                encoder=selected_encoder,
+                has_audio=False,
+            )
+            _mux_item_with_audio(visual_path, audio_path, item_path, audio_duration, encoder=selected_encoder)
+        _apply_item_audio_boundary_fades(item_path, encoder=selected_encoder)
         item_paths.append(item_path)
-        print(f"[video] {key} mode={audio_mode} clips={len(clip_paths)} {audio_duration:.3f}s")
+        print(f"[video] {key} clips={len(clip_paths)} {audio_duration:.3f}s")
         if progress_callback:
             progress_callback((item_index / max(1, total_items)) * 85.0, f"Rendered video segments {item_index}/{total_items}")
 
     output_path = output_dir / output_name
     if progress_callback:
         progress_callback(90.0, "Merging final video")
-    _concat_videos(item_paths, output_path, reencode=True, encoder=selected_encoder)
+    _concat_videos(item_paths, output_path, reencode=True, encoder=selected_encoder, has_audio=True)
     if progress_callback:
         progress_callback(100.0, "Video render complete")
     return {
@@ -698,6 +1070,7 @@ def generate_jianying_draft(
     assets_audio_dir.mkdir(parents=True, exist_ok=True)
 
     source_map: dict[str, tuple[str, Path]] = {}
+    silent_clip_map: dict[str, tuple[str, Path]] = {}
     audio_map: dict[str, tuple[str, Path, int]] = {}
     video_materials: list[dict[str, Any]] = []
     audio_materials: list[dict[str, Any]] = []
@@ -707,36 +1080,61 @@ def generate_jianying_draft(
     timeline_cursor_us = 0
     first_video: Path | None = None
     total_items = len(items)
+    draft_encoder = _select_video_encoder("auto")
+    fallback_meta = _first_clip_video_meta(items)
+    silent_cache_dir = assets_video_dir / "silent_clips"
+    silent_cache_dir.mkdir(parents=True, exist_ok=True)
 
     for item_index, item in enumerate(items, start=1):
         key = str(item.get("item_id") or item.get("segment_id") or f"item_{item_index:03d}")
-        audio_mode = audio_mode_for_item(item)
-        if audio_mode == "original":
-            audio = original_audio_result(item)
-            clips = [c for c in (item.get("video_clips") or []) if isinstance(c, dict)]
-        else:
-            audio = audio_results[key]
-            clips = _retime_clips_to_audio(item, float(audio["duration"]))
+        audio = audio_results[key]
+        audio_dur = float(audio["duration"])
+        use_original_audio = _is_original_audio_item(item, audio)
+        clips = _retime_clips_to_audio(item, audio_dur)
         item_start_us = timeline_cursor_us
         item_duration_us = 0
 
-        for clip in clips:
+        for clip_index, clip in enumerate(clips, start=1):
             source_src = _source_path(str(clip.get("source") or ""))
-            source_key = str(source_src)
-            if source_key not in source_map:
-                copied = _copy_unique(source_src, assets_video_dir)
-                material_id = uuid.uuid4().hex
-                source_map[source_key] = (material_id, copied)
-                video_materials.append(_make_video_material(material_id, copied))
-                if first_video is None:
-                    first_video = copied
-            material_id, copied_path = source_map[source_key]
-            source_duration = probe_duration(copied_path)
             start = max(0.0, float(clip.get("movie_start") or 0.0))
             duration = max(0.03, float(clip.get("movie_end") or 0.0) - start)
-            if source_duration > 0:
-                duration = min(duration, max(0.03, source_duration - start))
+            source_start_us = _s_to_us(start)
+
+            if use_original_audio:
+                source_key = str(source_src)
+                if source_key not in source_map:
+                    copied = _copy_unique(source_src, assets_video_dir)
+                    material_id = uuid.uuid4().hex
+                    source_map[source_key] = (material_id, copied)
+                    video_materials.append(_make_video_material(material_id, copied))
+                    if first_video is None:
+                        first_video = copied
+                material_id, copied_path = source_map[source_key]
+                source_duration = probe_duration(copied_path)
+                if source_duration > 0:
+                    duration = min(duration, max(0.03, source_duration - start))
+            else:
+                clip_key = f"{source_src}|{start:.3f}|{duration:.3f}"
+                if clip_key not in silent_clip_map:
+                    silent_path = silent_cache_dir / f"{item_index:04d}_{clip_index:03d}.mp4"
+                    _cut_video_clip(
+                        source_src,
+                        start,
+                        duration,
+                        silent_path,
+                        encoder=draft_encoder,
+                        keep_audio=False,
+                    )
+                    material_id = uuid.uuid4().hex
+                    silent_clip_map[clip_key] = (material_id, silent_path)
+                    video_materials.append(_make_video_material(material_id, silent_path))
+                    if first_video is None:
+                        first_video = silent_path
+                material_id, _ = silent_clip_map[clip_key]
+                source_start_us = 0
+
             duration_us = _s_to_us(duration)
+            segment_volume = 1 if use_original_audio else 0
             speed_id = uuid.uuid4().hex
             speed_materials.append({"curve_speed": None, "id": speed_id, "mode": 0, "speed": 1, "type": "speed"})
             video_segments.append(
@@ -748,7 +1146,7 @@ def generate_jianying_draft(
                     "enable_color_wheels": True,
                     "enable_lut": True,
                     "enable_smart_color_adjust": False,
-                    "last_nonzero_volume": 1,
+                    "last_nonzero_volume": segment_volume,
                     "reverse": False,
                     "track_attribute": 0,
                     "track_render_index": 0,
@@ -758,9 +1156,9 @@ def generate_jianying_draft(
                     "target_timerange": {"start": timeline_cursor_us, "duration": duration_us},
                     "common_keyframes": [],
                     "keyframe_refs": [],
-                    "source_timerange": {"start": _s_to_us(start), "duration": duration_us},
+                    "source_timerange": {"start": source_start_us, "duration": duration_us},
                     "speed": 1,
-                    "volume": 1 if audio_mode == "original" else 0,
+                    "volume": segment_volume,
                     "extra_material_refs": [speed_id],
                     "clip": {"alpha": 1, "flip": {"horizontal": False, "vertical": False}, "rotation": 0, "scale": {"x": 1, "y": 1}, "transform": {"x": 0, "y": 0}},
                     "uniform_scale": {"on": True, "value": 1},
@@ -771,46 +1169,105 @@ def generate_jianying_draft(
             timeline_cursor_us += duration_us
             item_duration_us += duration_us
 
-        if audio_mode == "original":
-            if progress_callback and (item_index == 1 or item_index == total_items or item_index % 10 == 0):
-                progress_callback((item_index / max(1, total_items)) * 70.0, f"Built draft timeline {item_index}/{total_items}")
-            continue
+        if not clips:
+            if use_original_audio:
+                raise ValueError(f"{key} 没有可用 video_clips")
 
-        audio_src = Path(str(audio["path"]))
-        audio_dur = float(audio["duration"])
-        copied_audio = _copy_unique(audio_src, assets_audio_dir)
-        audio_key = str(copied_audio)
-        audio_duration_us = _s_to_us(audio_dur)
-        if audio_key not in audio_map:
-            audio_mat_id = uuid.uuid4().hex
-            audio_map[audio_key] = (audio_mat_id, copied_audio, audio_duration_us)
-            audio_materials.append(_make_audio_material(audio_mat_id, copied_audio, audio_duration_us))
-        audio_mat_id, _, _ = audio_map[audio_key]
-        audio_speed_id = uuid.uuid4().hex
-        speed_materials.append({"curve_speed": None, "id": audio_speed_id, "mode": 0, "speed": 1, "type": "speed"})
-        audio_segments.append(
-            {
-                "enable_adjust": True,
-                "last_nonzero_volume": 1,
-                "reverse": False,
-                "track_attribute": 0,
-                "track_render_index": 0,
-                "visible": True,
-                "id": uuid.uuid4().hex,
-                "material_id": audio_mat_id,
-                "target_timerange": {"start": item_start_us, "duration": min(audio_duration_us, max(audio_duration_us, item_duration_us))},
-                "common_keyframes": [],
-                "keyframe_refs": [],
-                "source_timerange": {"start": 0, "duration": audio_duration_us},
-                "speed": 1,
-                "volume": 1,
-                "extra_material_refs": [audio_speed_id],
-                "is_tone_modify": False,
-                "clip": None,
-                "hdr_settings": None,
-                "render_index": 0,
-            }
-        )
+            duration = max(0.03, audio_dur)
+            fallback_clip = _nearest_video_clip(items, item_index - 1)
+            fallback_path = silent_cache_dir / f"{item_index:04d}_fallback.mp4"
+            if fallback_clip:
+                source_src = _source_path(str(fallback_clip.get("source") or ""))
+                start = max(0.0, float(fallback_clip.get("movie_start") or 0.0))
+                source_duration = probe_duration(source_src)
+                if source_duration > 0:
+                    duration = min(duration, max(0.03, source_duration))
+                    start = min(start, max(0.0, source_duration - duration))
+                _cut_video_clip(
+                    source_src,
+                    start,
+                    duration,
+                    fallback_path,
+                    encoder=draft_encoder,
+                    keep_audio=False,
+                )
+            else:
+                _make_blank_video(duration, fallback_path, encoder=draft_encoder, meta=fallback_meta)
+
+            material_id = uuid.uuid4().hex
+            video_materials.append(_make_video_material(material_id, fallback_path))
+            if first_video is None:
+                first_video = fallback_path
+            duration_us = _s_to_us(audio_dur)
+            speed_id = uuid.uuid4().hex
+            speed_materials.append({"curve_speed": None, "id": speed_id, "mode": 0, "speed": 1, "type": "speed"})
+            video_segments.append(
+                {
+                    "enable_adjust": True,
+                    "enable_color_correct_adjust": False,
+                    "enable_color_curves": True,
+                    "enable_color_match_adjust": False,
+                    "enable_color_wheels": True,
+                    "enable_lut": True,
+                    "enable_smart_color_adjust": False,
+                    "last_nonzero_volume": 0,
+                    "reverse": False,
+                    "track_attribute": 0,
+                    "track_render_index": 0,
+                    "visible": True,
+                    "id": uuid.uuid4().hex,
+                    "material_id": material_id,
+                    "target_timerange": {"start": timeline_cursor_us, "duration": duration_us},
+                    "common_keyframes": [],
+                    "keyframe_refs": [],
+                    "source_timerange": {"start": 0, "duration": duration_us},
+                    "speed": 1,
+                    "volume": 0,
+                    "extra_material_refs": [speed_id],
+                    "clip": {"alpha": 1, "flip": {"horizontal": False, "vertical": False}, "rotation": 0, "scale": {"x": 1, "y": 1}, "transform": {"x": 0, "y": 0}},
+                    "uniform_scale": {"on": True, "value": 1},
+                    "hdr_settings": {"intensity": 1, "mode": 1, "nits": 1000},
+                    "render_index": 0,
+                }
+            )
+            timeline_cursor_us += duration_us
+            item_duration_us += duration_us
+
+        if not use_original_audio:
+            audio_src = Path(str(audio["path"]))
+            copied_audio = _copy_unique(audio_src, assets_audio_dir)
+            audio_key = str(copied_audio)
+            audio_duration_us = _s_to_us(audio_dur)
+            if audio_key not in audio_map:
+                audio_mat_id = uuid.uuid4().hex
+                audio_map[audio_key] = (audio_mat_id, copied_audio, audio_duration_us)
+                audio_materials.append(_make_audio_material(audio_mat_id, copied_audio, audio_duration_us))
+            audio_mat_id, _, _ = audio_map[audio_key]
+            audio_speed_id = uuid.uuid4().hex
+            speed_materials.append({"curve_speed": None, "id": audio_speed_id, "mode": 0, "speed": 1, "type": "speed"})
+            audio_segments.append(
+                {
+                    "enable_adjust": True,
+                    "last_nonzero_volume": 1,
+                    "reverse": False,
+                    "track_attribute": 0,
+                    "track_render_index": 0,
+                    "visible": True,
+                    "id": uuid.uuid4().hex,
+                    "material_id": audio_mat_id,
+                    "target_timerange": {"start": item_start_us, "duration": min(audio_duration_us, item_duration_us)},
+                    "common_keyframes": [],
+                    "keyframe_refs": [],
+                    "source_timerange": {"start": 0, "duration": min(audio_duration_us, item_duration_us)},
+                    "speed": 1,
+                    "volume": 1,
+                    "extra_material_refs": [audio_speed_id],
+                    "is_tone_modify": False,
+                    "clip": None,
+                    "hdr_settings": None,
+                    "render_index": 0,
+                }
+            )
 
         if progress_callback and (item_index == 1 or item_index == total_items or item_index % 10 == 0):
             progress_callback((item_index / max(1, total_items)) * 70.0, f"Built draft timeline {item_index}/{total_items}")
@@ -902,23 +1359,6 @@ def write_manifest(output_dir: Path, payload: dict[str, Any]) -> Path:
     return write_json(output_dir / "generate_video_result.json", payload)
 
 
-def _serialize_audio_results(audio_results: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    rows: dict[str, dict[str, Any]] = {}
-    for key, value in audio_results.items():
-        path = str(value.get("path") or "")
-        row = {
-            "path": relpath(path) if path else "",
-            "duration": value.get("duration"),
-        }
-        for flag in ("original_audio", "silent", "reused"):
-            if flag in value:
-                row[flag] = value[flag]
-        if "voice_id" in value:
-            row["voice_id"] = value["voice_id"]
-        rows[key] = row
-    return rows
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="第 8 步：生成剪映草稿或直接合成视频")
     parser.add_argument("--timeline", default=r".\outputs\7_timeline_composer\final_timeline.json")
@@ -933,6 +1373,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jianying-draft-dir", help="可选：直接输出到剪映草稿根目录")
     parser.add_argument("--video-output-name", default="clone_narration_output.mp4")
     parser.add_argument("--video-encoder", choices=["auto", "libx264", "h264_nvenc"], default=os.getenv("CLONE_VIDEO_ENCODER") or "auto")
+    parser.add_argument("--ref-analysis", help="可选：第 1 步 ref_analysis.json，用于参考视频字幕")
+    parser.add_argument("--script-mapping", help="可选：第 5 步 script_mapping.json，用于原片播放/电影字幕")
+    parser.add_argument("--output-root", help="可选：outputs 根目录，用于自动查找流水线数据")
     return parser
 
 
@@ -941,6 +1384,7 @@ async def async_main(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     data = read_json(resolve_existing_path(args.timeline))
     items = _timeline_items(data)
+    _ensure_edge_tts_available(items)
 
     audio_results = await synthesize_timeline_audio(
         items,
@@ -957,7 +1401,15 @@ async def async_main(args: argparse.Namespace) -> None:
         "mode": args.mode,
         "timeline": str(args.timeline),
         "audio_dir": relpath(output_dir / "audio"),
-        "audio_results": _serialize_audio_results(audio_results),
+        "audio_results": {
+            k: {
+                "path": relpath(v["path"]) if v.get("path") else "",
+                "duration": v["duration"],
+                "use_original_audio": bool(v.get("use_original_audio")),
+                "source": v.get("source") or "",
+            }
+            for k, v in audio_results.items()
+        },
     }
     if args.mode in {"draft", "both"}:
         draft_root = Path(args.jianying_draft_dir).resolve() if args.jianying_draft_dir else None
@@ -986,6 +1438,19 @@ async def async_main(args: argparse.Namespace) -> None:
                 message,
             ),
         )
+
+    output_root = Path(args.output_root).resolve() if args.output_root else output_dir.parent
+    ref_analysis_data = read_json(args.ref_analysis) if args.ref_analysis else None
+    script_mapping_data = read_json(args.script_mapping) if args.script_mapping else None
+    shot_breakdown = build_shot_breakdown(
+        items,
+        audio_results=audio_results,
+        ref_analysis=ref_analysis_data,
+        script_mapping=script_mapping_data,
+        output_root=output_root,
+    )
+    shot_breakdown_path = write_json(output_dir / "shot_breakdown.json", shot_breakdown)
+    result["shot_breakdown"] = relpath(shot_breakdown_path)
 
     manifest = write_manifest(output_dir, result)
     emit_progress("render", 100, "Video generation complete")

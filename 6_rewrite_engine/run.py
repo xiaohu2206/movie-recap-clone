@@ -19,8 +19,9 @@ from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
 
-# 大写配置-是否用大模型生成仿稿
-USE_AI_REWRITE = False  # 默认 False：直接沿用原稿；True 时调用大模型改写
+
+USE_LLM_REWRITE = False  # True=大模型生成仿稿；False=直接使用原稿（默认）
+
 
 SYSTEM_PROMPT = """你是影视解说仿稿助手。
 目标：基于旧文案结构，生成结构相似但表达不同的新文案。
@@ -117,6 +118,25 @@ def _segment_new_text_from_units(rewritten_units: list[dict[str, Any]]) -> str:
     return _join_text([str(unit.get("new_text") or "") for unit in rewritten_units if not unit.get("keep_original_audio")])
 
 
+def _narration_old_text(item: dict[str, Any]) -> str:
+    narration_part = item.get("narration_part") or {}
+    if isinstance(narration_part, dict):
+        text = str(narration_part.get("old_text") or "").strip()
+        if text:
+            return text
+    return str(item.get("old_text") or item.get("text") or "")
+
+
+def _audio_fields(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "audio_pattern": item.get("audio_pattern") or "all_narration",
+        "split_clip_index": item.get("split_clip_index"),
+        "narration_part": item.get("narration_part") or {},
+        "original_audio_part": item.get("original_audio_part") or {},
+        "movie_time_ranges": item.get("movie_time_ranges") or [],
+    }
+
+
 def _build_batch_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     rewrite_input = []
     has_units = any(_text_units(item) for item in items)
@@ -124,7 +144,7 @@ def _build_batch_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
         ranges = item.get("movie_time_ranges") or []
         payload_item = {
             "segment_id": item.get("segment_id"),
-            "old_text": item.get("old_text") or item.get("text") or "",
+            "old_text": _narration_old_text(item),
             "text_role": item.get("text_role") or "narration",
             "segment_audio_role": item.get("segment_audio_role"),
             "ref_time_range": item.get("ref_time_range") or {},
@@ -151,35 +171,33 @@ def _build_batch_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
                 if _is_narration_unit(unit)
             ]
         rewrite_input.append(payload_item)
+    output_schema: dict[str, Any] = {
+        "rewritten_script": [
+            {
+                "segment_id": "seg_001",
+                "new_text": "新的中文解说文案",
+            }
+        ]
+    }
     if has_units:
-        output_schema = {
-            "rewritten_script": [
-                {
-                    "segment_id": "seg_without_text_units",
-                    "new_text": "新的中文解说文案",
-                }
-            ],
-            "rewritten_units": [
-                {
-                    "unit_id": "seg_001_unit_001",
-                    "new_text": "新的中文解说文案",
-                }
-            ]
-        }
-    else:
-        output_schema = {
-            "rewritten_script": [
-                {
-                    "segment_id": "seg_001",
-                    "new_text": "新的中文解说文案",
-                }
-            ]
-        }
+        output_schema["rewritten_units"] = [
+            {
+                "unit_id": "seg_001_unit_001",
+                "new_text": "新的中文解说文案",
+            }
+        ]
     return {
         "task": "rewrite_narration_segments",
         "input": rewrite_input,
         "output_schema": output_schema,
     }
+
+
+def _is_connectivity_error(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    name = type(exc).__name__.lower()
+    return "connect" in name or "timeout" in name
 
 
 async def _call_ai_batch(
@@ -196,12 +214,14 @@ async def _call_ai_batch(
             messages,
             extra_params={"response_format": {"type": "json_object"}},
         )
-    except Exception:
+    except Exception as exc:
+        if _is_connectivity_error(exc):
+            raise
         response = await provider.chat_completion(messages)
 
+    result: dict[str, str] = {}
     parsed = _extract_json(response.content)
     unit_rows = parsed.get("rewritten_units") or []
-    result: dict[str, str] = {}
     if isinstance(unit_rows, list):
         for row in unit_rows:
             if not isinstance(row, dict):
@@ -237,12 +257,18 @@ def pass_through_script(
 ) -> dict[str, Any]:
     rewritten: list[dict[str, Any]] = []
     total = len(script_mapping)
-    for index, item in enumerate(script_mapping):
+    for idx, item in enumerate(script_mapping, start=1):
         seg_id = str(item.get("segment_id") or "")
-        old_text = str(item.get("old_text") or item.get("text") or "")
-        role = str(item.get("text_role") or "narration")
+        audio_pattern = str(item.get("audio_pattern") or "all_narration")
+        old_text = _narration_old_text(item)
         rewritten_units = _build_rewritten_units(item, unit_rewrites={}, passthrough_narration=True)
-        new_text = _segment_new_text_from_units(rewritten_units) if rewritten_units else old_text
+        if audio_pattern == "all_original_audio":
+            new_text = ""
+        elif rewritten_units:
+            new_text = _segment_new_text_from_units(rewritten_units)
+        else:
+            new_text = old_text
+        role = str(item.get("text_role") or "narration")
         rewritten.append(
             {
                 "segment_id": seg_id,
@@ -254,21 +280,32 @@ def pass_through_script(
                 "segment_audio_role": item.get("segment_audio_role"),
                 "rewritten_units": rewritten_units,
                 "ref_time_range": item.get("ref_time_range") or {},
-                "movie_time_ranges": item.get("movie_time_ranges") or [],
-                "rewrite_status": "original",
+                **_audio_fields(item),
+                "rewrite_status": "original_audio_skip" if audio_pattern == "all_original_audio" else "original",
             }
         )
         if progress_callback:
-            done = index + 1
-            progress_callback((done / max(1, total)) * 100.0, f"Passed through segments {done}/{total}")
+            progress_callback(
+                (idx / max(1, total)) * 100.0,
+                f"Pass-through segments {idx}/{total}",
+            )
 
     return {
         "rewritten_script": rewritten,
         "rewrite_backend": {
-            "provider": "passthrough",
+            "provider": "original",
             "use_ai_rewrite": False,
+            "use_llm_rewrite": False,
         },
     }
+
+
+def pass_through_original_script(
+    script_mapping: list[dict[str, Any]],
+    *,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> dict[str, Any]:
+    return pass_through_script(script_mapping, progress_callback=progress_callback)
 
 
 async def rewrite_script(
@@ -284,7 +321,8 @@ async def rewrite_script(
     api_key = (api_key or "").strip()
     base_url = (base_url or "").strip()
     model = (model or "").strip()
-    if not api_key:
+    llm_items = [item for item in script_mapping if str(item.get("audio_pattern") or "all_narration") != "all_original_audio"]
+    if llm_items and not api_key:
         raise ValueError("缺少 AI API Key")
 
     cfg = AIModelConfig(
@@ -299,16 +337,39 @@ async def rewrite_script(
     rewritten: list[dict[str, Any]] = []
 
     try:
-        total = len(script_mapping)
-        for start in range(0, len(script_mapping), max(1, batch_size)):
-            batch = script_mapping[start : start + max(1, batch_size)]
+        skipped = {
+            str(item.get("segment_id") or ""): item
+            for item in script_mapping
+            if str(item.get("audio_pattern") or "all_narration") == "all_original_audio"
+        }
+        rewritten_by_id: dict[str, dict[str, Any]] = {}
+
+        for seg_id, item in skipped.items():
+            old_text = _narration_old_text(item)
+            rewritten_by_id[seg_id] = {
+                "segment_id": seg_id,
+                "old_text": old_text,
+                "new_text": "",
+                "old_char_count": _char_len(old_text),
+                "new_char_count": 0,
+                "text_role": str(item.get("text_role") or "narration"),
+                "segment_audio_role": item.get("segment_audio_role"),
+                "rewritten_units": _build_rewritten_units(item, unit_rewrites={}, passthrough_narration=False),
+                "ref_time_range": item.get("ref_time_range") or {},
+                **_audio_fields(item),
+                "rewrite_status": "original_audio_skip",
+            }
+
+        total = len(llm_items)
+        for start in range(0, len(llm_items), max(1, batch_size)):
+            batch = llm_items[start : start + max(1, batch_size)]
             if progress_callback:
                 progress_callback((start / max(1, total)) * 100.0, f"Rewriting batch {start + 1}-{start + len(batch)} of {total}")
             ai_rows = await _call_ai_batch(provider, batch)
 
             for item in batch:
                 seg_id = str(item.get("segment_id") or "")
-                old_text = str(item.get("old_text") or "")
+                old_text = _narration_old_text(item)
                 role = str(item.get("text_role") or "narration")
                 units = _text_units(item)
                 if units:
@@ -326,24 +387,27 @@ async def rewrite_script(
                     if not new_text:
                         raise ValueError(f"AI 返回缺少 segment_id={seg_id} 的 new_text")
                     rewritten_units = []
-                rewritten.append(
-                    {
-                        "segment_id": seg_id,
-                        "old_text": old_text,
-                        "new_text": new_text,
-                        "old_char_count": _char_len(old_text),
-                        "new_char_count": _char_len(new_text),
-                        "text_role": role,
-                        "segment_audio_role": item.get("segment_audio_role"),
-                        "rewritten_units": rewritten_units,
-                        "ref_time_range": item.get("ref_time_range") or {},
-                        "movie_time_ranges": item.get("movie_time_ranges") or [],
-                        "rewrite_status": "ai_rewritten",
-                    }
-                )
+                rewritten_by_id[seg_id] = {
+                    "segment_id": seg_id,
+                    "old_text": old_text,
+                    "new_text": new_text,
+                    "old_char_count": _char_len(old_text),
+                    "new_char_count": _char_len(new_text),
+                    "text_role": role,
+                    "segment_audio_role": item.get("segment_audio_role"),
+                    "rewritten_units": rewritten_units,
+                    "ref_time_range": item.get("ref_time_range") or {},
+                    **_audio_fields(item),
+                    "rewrite_status": "ai_rewritten",
+                }
             if progress_callback:
                 done = min(total, start + len(batch))
                 progress_callback((done / max(1, total)) * 100.0, f"Rewritten segments {done}/{total}")
+
+        for item in script_mapping:
+            seg_id = str(item.get("segment_id") or "")
+            if seg_id in rewritten_by_id:
+                rewritten.append(rewritten_by_id[seg_id])
     finally:
         await provider.close()
 
@@ -354,6 +418,7 @@ async def rewrite_script(
             "model": model,
             "batch_size": batch_size,
             "use_ai_rewrite": True,
+            "use_llm_rewrite": True,
         },
     }
 
@@ -395,25 +460,26 @@ def main() -> None:
     if not isinstance(script_mapping, list):
         raise SystemExit("script_mapping.json 缺少 script_mapping 数组")
 
-    if USE_AI_REWRITE:
+    progress_callback = lambda percent, message: emit_progress("rewrite", percent, message)
+    if USE_LLM_REWRITE:
         if not args.api_key:
             raise SystemExit("缺少 AI API Key：请传 --api-key 或设置 CLONE_AI_API_KEY / OPENAI_API_KEY")
-        result = asyncio.run(
-            rewrite_script(
-                script_mapping,
-                api_key=args.api_key,
-                base_url=args.base_url,
-                model=args.model,
-                temperature=args.temperature,
-                batch_size=args.batch_size,
-                progress_callback=lambda percent, message: emit_progress("rewrite", percent, message),
+        try:
+            result = asyncio.run(
+                rewrite_script(
+                    script_mapping,
+                    api_key=args.api_key,
+                    base_url=args.base_url,
+                    model=args.model,
+                    temperature=args.temperature,
+                    batch_size=args.batch_size,
+                    progress_callback=progress_callback,
+                )
             )
-        )
+        except ConnectionError as exc:
+            raise SystemExit(str(exc)) from None
     else:
-        result = pass_through_script(
-            script_mapping,
-            progress_callback=lambda percent, message: emit_progress("rewrite", percent, message),
-        )
+        result = pass_through_script(script_mapping, progress_callback=progress_callback)
     out = write_json(Path(args.output_dir) / "rewritten_script.json", result)
     print(out)
 

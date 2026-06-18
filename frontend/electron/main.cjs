@@ -37,12 +37,89 @@ function rendererUrl() {
   return "http://127.0.0.1:5173";
 }
 
+function bundledPython(root) {
+  const portablePython = path.join(root, "python", "python.exe");
+  if (fs.existsSync(portablePython)) {
+    return portablePython;
+  }
+  const venvPython = path.join(root, ".venv", "Scripts", "python.exe");
+  if (fs.existsSync(venvPython)) {
+    return venvPython;
+  }
+  return "";
+}
+
+function hasBundledPython(root) {
+  return Boolean(bundledPython(root));
+}
+
 function candidatePython(root) {
-  const localPython = path.join(root, ".venv", "Scripts", "python.exe");
-  if (fs.existsSync(localPython)) {
-    return localPython;
+  const resolved = bundledPython(root);
+  if (resolved) {
+    return resolved;
+  }
+  if (app.isPackaged) {
+    logMain("bundled python missing under backend/python or backend/.venv");
   }
   return process.platform === "win32" ? "python" : "python3";
+}
+
+function bundledFfmpegDir(root) {
+  const binDir = path.join(root, "ffmpeg", "bin");
+  if (fs.existsSync(path.join(binDir, "ffmpeg.exe")) && fs.existsSync(path.join(binDir, "ffprobe.exe"))) {
+    return binDir;
+  }
+  return "";
+}
+
+function pythonRuntimeEnv(root, extra = {}) {
+  const env = {
+    ...process.env,
+    PYTHONIOENCODING: "utf-8",
+    ...extra,
+  };
+  const ffmpegDir = bundledFfmpegDir(root);
+  if (ffmpegDir) {
+    env.FFMPEG_DIR = ffmpegDir;
+    env.PATH = env.PATH ? `${ffmpegDir}${path.delimiter}${env.PATH}` : ffmpegDir;
+  }
+  if (process.platform !== "win32") {
+    return env;
+  }
+  const torchLibDirs = [
+    path.join(root, "python", "Lib", "site-packages", "torch", "lib"),
+    path.join(root, "python", "torch_fallbacks", "cu128", "Lib", "site-packages", "torch", "lib"),
+    path.join(root, "python", "torch_fallbacks", "cu124", "Lib", "site-packages", "torch", "lib"),
+    path.join(root, "python", "torch_fallbacks", "cu121", "Lib", "site-packages", "torch", "lib"),
+    path.join(root, ".venv", "Lib", "site-packages", "torch", "lib"),
+  ].filter((item) => fs.existsSync(item));
+  if (torchLibDirs.length) {
+    const prefix = [...new Set(torchLibDirs)].join(path.delimiter);
+    env.PATH = env.PATH ? `${prefix}${path.delimiter}${env.PATH}` : prefix;
+  }
+  return env;
+}
+
+function sanitizeStoredPath(value) {
+  if (!value || typeof value !== "string") {
+    return "";
+  }
+  let fixed = value.replace(/\r/g, "");
+  fixed = fixed.replace(/([A-Za-z]:)esources/g, "$1\\resources");
+  return path.normalize(fixed);
+}
+
+function sanitizePipelineConfig(config = {}) {
+  const next = { ...config };
+  for (const key of ["refVideoPath", "moviePath", "subtitlePath", "outputRoot", "jianyingDraftDir"]) {
+    if (typeof next[key] === "string" && next[key]) {
+      next[key] = sanitizeStoredPath(next[key]);
+    }
+  }
+  if (!next.outputRoot) {
+    next.outputRoot = path.join(projectRoot(), "outputs");
+  }
+  return next;
 }
 
 function jianyingDraftCandidates() {
@@ -83,7 +160,10 @@ const stageOutputs = [
   ["segments", "2_narration_segmenter", "narration_segments.json"],
   ["shots", "3_movie_shot_parser", "movie_shots.json"],
   ["alignment", "4_visual_alignment_engine", "ref_to_movie_timeline.json"],
+  ["ref_audio_rebuild", "4.1_ref_audio_rebuild_composer", "ref_audio_rebuild_timeline.json"],
   ["binder", "5_script_visual_binder", "script_mapping.json"],
+  ["subtitle", "5.1_movie_subtitle_filler", "script_mapping_subtitled.json"],
+  ["audio_role", "5.2_audio_role_classifier", "script_mapping_with_audio.json"],
   ["rewrite", "6_rewrite_engine", "rewritten_script.json"],
   ["timeline", "7_timeline_composer", "final_timeline.json"],
   ["render", "8_generate_video", "generate_video_result.json"],
@@ -128,9 +208,11 @@ function appendPipelineLog(logPath, level, text) {
 
 function configSignature(config = {}) {
   return JSON.stringify({
+    pipelineMode: config.pipelineMode || "clone",
     refVideoPath: config.refVideoPath || "",
     moviePath: config.moviePath || "",
     subtitlePath: config.subtitlePath || "",
+    movieSubtitlePath: config.movieSubtitlePath || "",
     outputRoot: config.outputRoot || "",
     asrProvider: config.subtitlePath ? "none" : config.asrProvider,
     threshold: config.threshold,
@@ -171,8 +253,11 @@ function writePipelineMemory(outputRoot, payload) {
   }
 }
 
-function hasCompletedFinalOutput(outputRoot, renderMode) {
+function hasCompletedFinalOutput(outputRoot, renderMode, pipelineMode = "clone") {
   if (renderMode === "none") {
+    if (pipelineMode === "ref_audio_rebuild") {
+      return hasValidJson(path.join(outputRoot, "4.1_ref_audio_rebuild_composer", "ref_audio_rebuild_timeline.json"));
+    }
     return hasValidJson(path.join(outputRoot, "7_timeline_composer", "final_timeline.json"));
   }
 
@@ -308,7 +393,8 @@ function normalizeChatUrl(baseUrl) {
 
 ipcMain.handle("config:load", async () => {
   try {
-    return JSON.parse(fs.readFileSync(userConfigPath(), "utf8"));
+    const config = JSON.parse(fs.readFileSync(userConfigPath(), "utf8"));
+    return sanitizePipelineConfig(config);
   } catch {
     return null;
   }
@@ -316,7 +402,7 @@ ipcMain.handle("config:load", async () => {
 
 ipcMain.handle("config:save", async (_event, config = {}) => {
   try {
-    fs.writeFileSync(userConfigPath(), JSON.stringify(config, null, 2), "utf8");
+    fs.writeFileSync(userConfigPath(), JSON.stringify(sanitizePipelineConfig(config), null, 2), "utf8");
     return { ok: true };
   } catch (error) {
     logMain(`config:save failed: ${error.message}`);
@@ -381,23 +467,27 @@ ipcMain.handle("backend:info", async () => {
   const root = projectRoot();
   return {
     root,
+    defaultOutputRoot: path.join(root, "outputs"),
     python: candidatePython(root),
     packaged: app.isPackaged,
+    hasBundledPython: fs.existsSync(path.join(root, "python", "python.exe")),
     hasLocalVenv: fs.existsSync(path.join(root, ".venv", "Scripts", "python.exe")),
   };
 });
 
 ipcMain.handle("pipeline:state", async (_event, config = {}) => {
   const root = projectRoot();
-  const outputRoot = config.outputRoot || path.join(root, "outputs");
+  const normalized = sanitizePipelineConfig(config);
+  const outputRoot = normalized.outputRoot || path.join(root, "outputs");
   const logPath = pipelineLogPath(outputRoot);
+  const pipelineMode = normalized.pipelineMode || "clone";
   const completedStages = stageOutputs
     .filter(([, dir, file]) => hasValidJson(path.join(outputRoot, dir, file)))
     .map(([id]) => id);
-  const finalStage = config.renderMode === "none" ? "timeline" : "render";
-  const finalOutputComplete = completedStages.includes(finalStage) && hasCompletedFinalOutput(outputRoot, config.renderMode);
+  const finalStage = normalized.renderMode === "none" ? (pipelineMode === "ref_audio_rebuild" ? "ref_audio_rebuild" : "timeline") : "render";
+  const finalOutputComplete = completedStages.includes(finalStage) && hasCompletedFinalOutput(outputRoot, normalized.renderMode, pipelineMode);
   const memory = readPipelineMemory(outputRoot);
-  const sameProject = !memory?.configSignature || memory.configSignature === configSignature({ ...config, outputRoot });
+  const sameProject = !memory?.configSignature || memory.configSignature === configSignature({ ...normalized, outputRoot });
   const completed = finalOutputComplete && (!memory || memory.status === "completed");
 
   return {
@@ -405,7 +495,8 @@ ipcMain.handle("pipeline:state", async (_event, config = {}) => {
     outputRoot,
     logPath,
     completed,
-    canResume: sameProject && completedStages.length > 0 && !completed,
+    canResume: completedStages.length > 0 && !completed,
+    configChanged: !sameProject,
     completedStages,
   };
 });
@@ -440,20 +531,30 @@ ipcMain.handle("pipeline:stop", async () => {
   return { ok: true };
 });
 
-ipcMain.handle("pipeline:start", async (_event, config) => {
+ipcMain.handle("pipeline:start", async (_event, rawConfig) => {
   if (activeProcess) {
     return { ok: false, error: "已有任务正在运行" };
   }
 
+  const runMode = String(rawConfig?.runMode || "normal");
+  const config = { ...sanitizePipelineConfig(rawConfig), runMode };
   const root = projectRoot();
   const mainScript = path.join(root, "main.py");
   if (!fs.existsSync(mainScript)) {
     return { ok: false, error: `找不到后端入口: ${mainScript}` };
   }
+  if (app.isPackaged && !hasBundledPython(root)) {
+    return {
+      ok: false,
+      error:
+        "安装包未包含 Python 运行环境（backend/python）。请重新执行 cnpm run pack:dir 打包完整安装包。",
+    };
+  }
 
   const outputRoot = config.outputRoot || path.join(root, "outputs");
   const logPath = pipelineLogPath(outputRoot);
   const renderMode = config.renderMode || "draft";
+  const pipelineMode = config.pipelineMode || "clone";
   if ((renderMode === "draft" || renderMode === "both") && config.jianyingDraftDir && !fs.existsSync(config.jianyingDraftDir)) {
     return { ok: false, error: `剪映草稿路径不存在: ${config.jianyingDraftDir}` };
   }
@@ -462,6 +563,8 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   const aiModel = String(config.aiModel || process.env.CLONE_AI_MODEL || process.env.OPENAI_MODEL || "").trim();
   const args = [
     mainScript,
+    "--pipeline-mode",
+    pipelineMode,
     "--ref-video-path",
     config.refVideoPath,
     "--movie-path",
@@ -497,6 +600,9 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   if (config.subtitlePath) {
     args.push("--subtitle-srt", config.subtitlePath);
   }
+  if (config.movieSubtitlePath) {
+    args.push("--movie-subtitle-srt", config.movieSubtitlePath);
+  }
   if (aiBaseUrl) {
     args.push("--ai-base-url", aiBaseUrl);
   }
@@ -506,21 +612,35 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   if (config.jianyingDraftDir) {
     args.push("--jianying-draft-dir", config.jianyingDraftDir);
   }
-  if (config.runMode === "resume") {
+  if (runMode === "render_only") {
+    if (renderMode === "none") {
+      return { ok: false, error: "请至少选择一种输出：剪映草稿或直出视频。" };
+    }
+    const prereqDir =
+      pipelineMode === "ref_audio_rebuild" ? "4.1_ref_audio_rebuild_composer" : "7_timeline_composer";
+    const prereqFile =
+      pipelineMode === "ref_audio_rebuild" ? "ref_audio_rebuild_timeline.json" : "final_timeline.json";
+    if (!hasValidJson(path.join(outputRoot, prereqDir, prereqFile))) {
+      return { ok: false, error: "未找到时间线产物，请先完成前序步骤。" };
+    }
+    args.push("--render-only");
+  } else if (runMode === "resume") {
     args.push("--resume");
-  }
-  if (config.runMode === "restart") {
+  } else if (runMode === "restart") {
     args.push("--restart");
   }
 
   fs.mkdirSync(outputRoot, { recursive: true });
   fs.mkdirSync(path.dirname(logPath), { recursive: true });
   fs.writeFileSync(logPath, `[${new Date().toISOString()}] [system] pipeline log created\n`, "utf8");
+  const existingCompletedStages = stageOutputs
+    .filter(([, dir, file]) => hasValidJson(path.join(outputRoot, dir, file)))
+    .map(([id]) => id);
   writePipelineMemory(outputRoot, {
     status: "running",
-    runMode: config.runMode || "normal",
-    configSignature: configSignature({ ...config, outputRoot, renderMode }),
-    completedStages: [],
+    runMode,
+    configSignature: configSignature({ ...config, outputRoot, renderMode, pipelineMode }),
+    completedStages: runMode === "restart" ? [] : existingCompletedStages,
     exitCode: null,
     error: "",
   });
@@ -529,13 +649,11 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
   const python = candidatePython(root);
   activeProcess = spawn(python, args, {
     cwd: root,
-    env: {
-      ...process.env,
-      PYTHONIOENCODING: "utf-8",
+    env: pythonRuntimeEnv(root, {
       CLONE_AI_API_KEY: aiApiKey,
       CLONE_AI_BASE_URL: aiBaseUrl,
       CLONE_AI_MODEL: aiModel,
-    },
+    }),
     windowsHide: true,
   });
 
@@ -545,7 +663,10 @@ ipcMain.handle("pipeline:start", async (_event, config) => {
     command: `${python} ${args.map((item) => (item.includes(" ") ? `"${item}"` : item)).join(" ")}`,
     outputRoot,
     logPath,
+    runMode,
+    completedStages: runMode === "restart" ? [] : existingCompletedStages,
   });
+  appendPipelineLog(logPath, "system", `run mode: ${runMode}`);
   appendPipelineLog(logPath, "system", `${python} ${args.join(" ")}`);
 
   activeProcess.stdout.on("data", (chunk) => {

@@ -64,9 +64,19 @@ def _resolve_bin(base: str) -> Optional[str]:
     roots.extend([Path.cwd(), Path(__file__).resolve().parents[2]])
 
     for root in roots:
-        for candidate in (root / name, root / "resources" / name, root / "src-tauri" / "resources" / name):
+        for candidate in (
+            root / name,
+            root / "ffmpeg" / "bin" / name,
+            root / "resources" / name,
+            root / "src-tauri" / "resources" / name,
+        ):
             if candidate.exists():
                 return str(candidate)
+
+    backend_root = Path(__file__).resolve().parents[1]
+    bundled = backend_root / "ffmpeg" / "bin" / name
+    if bundled.exists():
+        return str(bundled)
 
     if os.name == "nt":
         for candidate in (
@@ -159,6 +169,24 @@ def probe_duration(path: str | Path) -> float:
         return float((data.get("format") or {}).get("duration") or 0.0)
     except Exception:
         return 0.0
+
+
+def probe_stream_duration(path: str | Path, codec_type: str) -> float:
+    """返回指定类型媒体流的最大 duration；无有效流时回退到 format.duration。"""
+    data = ffprobe_json(path)
+    best = 0.0
+    for stream in data.get("streams") or []:
+        if stream.get("codec_type") != codec_type:
+            continue
+        try:
+            duration = float(stream.get("duration") or 0.0)
+        except Exception:
+            duration = 0.0
+        if duration > 0:
+            best = max(best, duration)
+    if best > 0:
+        return best
+    return probe_duration(path)
 
 
 def probe_fps(path: str | Path) -> float:

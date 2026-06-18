@@ -9,6 +9,11 @@ data/
 frontend/node_modules/
 frontend/dist/
 frontend/release/
+frontend/release-new/
+frontend/release-new-1/
+frontend/release-new-2/
+portable-python/
+frontend/release-full/
 
 # Frontend local caches and logs
 frontend/.vite/
@@ -18,3 +23,5 @@ frontend/yarn-debug.log*
 frontend/yarn-error.log*
 frontend/pnpm-debug.log*
 .env
+
+ffmpeg/

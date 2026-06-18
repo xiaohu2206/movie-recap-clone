@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import math
+import csv
+import json
+import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+MODULE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = MODULE_DIR.parent
+sys.path.insert(0, str(MODULE_DIR))
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from utils.cli_bootstrap import add_project_to_syspath
 
 add_project_to_syspath()
@@ -14,22 +21,24 @@ add_project_to_syspath()
 from clone_narration_video.utils.json_io import read_json, write_json
 from clone_narration_video.utils.progress import emit_progress
 from clone_narration_video.utils.project_paths import default_output_dir
-from clone_narration_video.utils.video_tools import cut_clip
-from clone_narration_video.utils.visual_features import build_shot_feature, compare_shot_features
+import run_shot_match_localize as shot_localizer
 
-from candidate_recall import build_candidates
-from diagnostics import build_timeline_item, write_low_confidence_report
-from path_solver import solve_greedy_path, solve_segmented_global_path
-from refinement import refine_candidates_for_ref
 
-ALGORITHM_VERSION = "visual_alignment_v3"
-# 大写配置-输出分割后的镜头
-EXPORT_MATCHED_SHOT_CLIPS = True              # 默认不开启；开启后按 ref 镜头建子文件夹输出配对片段
-MATCHED_SHOT_CLIPS_DIRNAME = "matched_shot_clips"  # 独立文件夹；每个 ref 镜头一个子文件夹
-MATCHED_SHOT_CLIPS_RATIO = 0.2                 # 默认只输出前 20% 的镜头
+ALGORITHM_VERSION = "shot_match_localize_orb_v1"
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")
+ACCEPTED_VISUAL_STATUSES = {"matched", "matched_low_confidence"}
 
-def _id(item: dict[str, Any], key: str) -> str:
-    return str(item.get(key) or item.get("shot_id") or "")
+
+@dataclass(frozen=True)
+class ShotClip:
+    index: int
+    shot_id: str
+    path: Path | None
+    start: float
+    end: float
+    duration: float
+    row: dict[str, Any]
+    keyframe_paths: tuple[Path, ...]
 
 
 def _progress(
@@ -41,10 +50,146 @@ def _progress(
         progress_callback(percent, message)
 
 
+def _round(value: Any, digits: int = 3) -> float:
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rows(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    rows = data.get(key) or []
+    if not isinstance(rows, list):
+        return []
+    return sorted(
+        (row for row in rows if isinstance(row, dict)),
+        key=lambda row: float(row.get("start") or 0.0),
+    )
+
+
+def _shot_id(row: dict[str, Any], id_key: str, index: int) -> str:
+    value = row.get(id_key) or row.get("shot_id")
+    if value:
+        return str(value)
+    if id_key == "ref_shot_id":
+        return f"ref_shot_{index + 1:03d}"
+    return f"movie_shot_{index + 1:06d}"
+
+
+def _find_clip_path(clip_dir: Path, shot_id: str) -> Path | None:
+    for extension in VIDEO_EXTENSIONS:
+        candidate = clip_dir / f"{shot_id}{extension}"
+        if candidate.exists():
+            return candidate
+    for candidate in clip_dir.glob(f"{shot_id}.*"):
+        if candidate.is_file() and candidate.suffix.lower() in VIDEO_EXTENSIONS:
+            return candidate
+    return None
+
+
+def build_shot_clips(
+    shot_rows: list[dict[str, Any]],
+    *,
+    clip_dir: str | Path,
+    id_key: str,
+) -> list[ShotClip]:
+    root = Path(clip_dir)
+    clips: list[ShotClip] = []
+    for index, row in enumerate(shot_rows):
+        shot_id = _shot_id(row, id_key, index)
+        start = float(row.get("start") or 0.0)
+        end = float(row.get("end") or start)
+        duration = float(row.get("duration") or max(0.0, end - start))
+        keyframe_paths = tuple(
+            path
+            for value in (row.get("keyframes") or [])
+            if isinstance(value, str) and value.strip() and (path := Path(value)).is_file()
+        )
+        clips.append(
+            ShotClip(
+                index=index,
+                shot_id=shot_id,
+                path=_find_clip_path(root, shot_id),
+                start=start,
+                end=end,
+                duration=max(0.0, duration),
+                row=row,
+                keyframe_paths=keyframe_paths,
+            )
+        )
+    return clips
+
+
+def _has_feature_source(clip: ShotClip) -> bool:
+    return clip.path is not None or bool(clip.keyframe_paths)
+
+
+def _extract_features(
+    clips: list[ShotClip],
+    *,
+    sample_count: int,
+    frame_size: int,
+    workers: int,
+    mask_text_bands: bool,
+) -> list[shot_localizer.ShotFeature]:
+    if all(clip.path is not None for clip in clips):
+        return shot_localizer.extract_all_features(
+            [clip.path for clip in clips if clip.path],
+            sample_count,
+            frame_size,
+            workers,
+            mask_text_bands=mask_text_bands,
+        )
+
+    sources = [
+        shot_localizer.KeyframeSource(
+            path=clip.path or Path(f"{clip.shot_id}.keyframes"),
+            frame_paths=() if clip.path else clip.keyframe_paths,
+            duration=clip.duration,
+        )
+        for clip in clips
+    ]
+    return shot_localizer.extract_all_keyframe_features(
+        sources,
+        sample_count,
+        frame_size,
+        workers,
+        mask_text_bands=mask_text_bands,
+    )
+
+
+def _escape_invalid_json_backslashes(text: str) -> str:
+    valid_escapes = {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}
+    chars: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] != "\\":
+            chars.append(text[index])
+            index += 1
+            continue
+        run_start = index
+        while index < len(text) and text[index] == "\\":
+            index += 1
+        run = text[run_start:index]
+        next_char = text[index] if index < len(text) else ""
+        chars.append(run)
+        if len(run) % 2 == 1 and next_char and next_char not in valid_escapes:
+            chars.append("\\")
+    return "".join(chars)
+
+
+def _read_json_tolerant(path: str | Path) -> Any:
+    try:
+        return read_json(path)
+    except json.JSONDecodeError:
+        text = Path(path).read_text(encoding="utf-8-sig")
+        return json.loads(_escape_invalid_json_backslashes(text))
+
+
 def _load_manual_overrides(path: str | Path | None) -> dict[str, str]:
     if not path:
         return {}
-    data = read_json(path)
+    data = _read_json_tolerant(path)
     rows = data.get("overrides") if isinstance(data, dict) else data
     overrides: dict[str, str] = {}
     if not isinstance(rows, list):
@@ -59,377 +204,530 @@ def _load_manual_overrides(path: str | Path | None) -> dict[str, str]:
     return overrides
 
 
-def _manual_candidate(
-    ref_feature: dict[str, Any],
-    movie_features: list[dict[str, Any]],
-    movie_shots: list[dict[str, Any]],
-    movie_id_to_index: dict[str, int],
-    movie_shot_id: str,
+def _candidate_row(
+    candidate: dict[str, Any],
+    movie_clips: list[ShotClip],
+    *,
+    rank: int,
+    selected_index: int,
 ) -> dict[str, Any] | None:
-    movie_index = movie_id_to_index.get(movie_shot_id)
-    if movie_index is None:
+    movie_index = int(candidate.get("movie_index", -1))
+    if not 0 <= movie_index < len(movie_clips):
         return None
-    movie = movie_shots[movie_index]
-    visual = compare_shot_features(ref_feature, movie_features[movie_index])
+    clip = movie_clips[movie_index]
+    score = max(0.0, min(1.0, float(candidate.get("score") or 0.0)))
     return {
-        "movie_index": movie_index,
-        "movie_shot_id": _id(movie, "movie_shot_id"),
-        "movie_start": float(movie.get("start") or 0.0),
-        "movie_end": float(movie.get("end") or 0.0),
-        "visual_score": float(visual["score"]),
-        "recall_score": float(visual["lightweight_score"]),
-        "final_score": float(visual["score"]),
-        "path_score": float(visual["score"]),
-        "visual_rank": None,
-        "final_rank": 1,
-        "detail": visual,
-        "refinement": {"enabled": False, "mode": "manual_override"},
-        "diagnostics": {
-            "transition_score": 1.0,
-            "continuity_score": 1.0,
-            "time_delta": 0.0,
-            "path_penalty": 0.0,
-            "path_continuous": True,
-            "boosted_by_continuity": False,
-            "path": {
-                "anchor": True,
-                "segment_index": None,
-                "jump_allowed": True,
-                "skip_state": False,
-            },
+        "movie_shot_id": clip.shot_id,
+        "movie_start": _round(clip.start),
+        "movie_end": _round(clip.end),
+        "visual_score": round(score, 4),
+        "recall_score": round(float(candidate.get("local_score") or 0.0), 4),
+        "final_score": round(score, 4),
+        "coarse_visual_score": round(float(candidate.get("global_score") or 0.0), 4),
+        "refinement_score": round(float(candidate.get("fine_score") or 0.0), 4),
+        "visual_rank": rank,
+        "final_rank": rank,
+        "selected": movie_index == selected_index,
+        "refinement": {
+            "enabled": True,
+            "mode": "orb_geometric_verification",
+            "geometry_score": round(float(candidate.get("geometry_score") or 0.0), 4),
+            "geometry_inliers": int(candidate.get("geometry_inliers") or 0),
+            "good_matches": int(candidate.get("good_matches") or 0),
+        },
+        "detail": {
+            "local_score": round(float(candidate.get("local_score") or 0.0), 4),
+            "global_score": round(float(candidate.get("global_score") or 0.0), 4),
+            "fine_score": round(float(candidate.get("fine_score") or 0.0), 4),
+            "sequence_support": round(float(candidate.get("sequence_support") or 0.0), 4),
         },
     }
 
 
-def _append_candidate_once(candidates: list[dict[str, Any]], candidate: dict[str, Any]) -> list[dict[str, Any]]:
-    movie_shot_id = str(candidate.get("movie_shot_id") or "")
-    for index, existing in enumerate(candidates):
-        if str(existing.get("movie_shot_id") or "") == movie_shot_id:
-            candidates[index] = {**existing, **candidate}
-            return candidates
-    return [candidate, *candidates]
+def _confidence(score: float, geometry_inliers: int, score_gap: float) -> str:
+    if score >= 0.72 and geometry_inliers >= 20 and score_gap >= 0.03:
+        return "high"
+    if score >= 0.55 or geometry_inliers >= 8:
+        return "medium"
+    return "low"
+
+
+def _timeline_item(
+    ref_clip: ShotClip,
+    match: dict[str, Any] | None,
+    movie_clips: list[ShotClip],
+    *,
+    min_score: float,
+    min_geometry_inliers: int,
+    top_k: int,
+    reason: str | None = None,
+    manual_override: bool = False,
+) -> dict[str, Any]:
+    selected_index = int((match or {}).get("movie_index", -1))
+    selected_clip = movie_clips[selected_index] if 0 <= selected_index < len(movie_clips) else None
+    raw_candidates = list((match or {}).get("top_candidates") or [])
+    candidates = [
+        row
+        for rank, candidate in enumerate(raw_candidates[: max(1, top_k)], start=1)
+        if (row := _candidate_row(candidate, movie_clips, rank=rank, selected_index=selected_index))
+    ]
+
+    score = max(0.0, min(1.0, float((match or {}).get("score") or 0.0)))
+    geometry_inliers = int((match or {}).get("geometry_inliers") or 0)
+    good_matches = int((match or {}).get("good_matches") or 0)
+    alternative_scores = [
+        float(candidate.get("final_score") or 0.0)
+        for candidate in candidates
+        if not candidate.get("selected")
+    ]
+    score_gap = round(score - max(alternative_scores), 4) if alternative_scores else round(score, 4)
+    confidence = _confidence(score, geometry_inliers, score_gap)
+
+    if reason:
+        status = reason
+        confidence = "low"
+    elif manual_override:
+        status = "matched"
+        confidence = "high"
+    elif score < min_score:
+        status = "needs_review"
+    elif confidence == "low" or geometry_inliers < min_geometry_inliers:
+        status = "matched_low_confidence"
+    else:
+        status = "matched"
+
+    return {
+        "ref_shot_id": ref_clip.shot_id,
+        "ref_start": _round(ref_clip.start),
+        "ref_end": _round(ref_clip.end),
+        "movie_start": _round(selected_clip.start) if selected_clip else None,
+        "movie_end": _round(selected_clip.end) if selected_clip else None,
+        "movie_shot_ids": [selected_clip.shot_id] if selected_clip else [],
+        "match_score": round(score, 4),
+        "final_score": round(score, 4),
+        "match_type": "manual_override" if manual_override else "independent_shot_localize",
+        "confidence": confidence,
+        "status": status,
+        "diagnostics": {
+            "score_gap": score_gap,
+            "geometry_inliers": geometry_inliers,
+            "good_matches": good_matches,
+            "accepted_reason": reason
+            or ("manual_override" if manual_override else "localized_by_run_shot_match_localize"),
+            "refinement": candidates[0].get("refinement") if candidates else {"enabled": False},
+        },
+        "candidates": candidates,
+    }
+
+
+def _manual_match(
+    ref_feature: shot_localizer.ShotFeature,
+    movie_feature: shot_localizer.ShotFeature,
+    movie_index: int,
+) -> dict[str, Any]:
+    score = max(0.0, min(1.0, shot_localizer.fine_score(ref_feature, movie_feature)))
+    candidate = {
+        "movie_index": movie_index,
+        "movie_name": movie_feature.path.name,
+        "score": score,
+        "geometry_score": 1.0,
+        "geometry_inliers": 999,
+        "good_matches": 999,
+        "local_score": score,
+        "global_score": score,
+        "fine_score": score,
+        "sequence_support": 0.0,
+        "movie_duration": movie_feature.duration,
+    }
+    return {
+        "movie_index": movie_index,
+        "score": score,
+        "geometry_inliers": 999,
+        "good_matches": 999,
+        "top_candidates": [candidate],
+        "manual_override": True,
+    }
 
 
 def _summary(timeline: list[dict[str, Any]]) -> dict[str, Any]:
-    total = len(timeline)
-    matched = [row for row in timeline if row.get("status") in {"matched", "matched_low_confidence", "inferred_by_neighbors"}]
+    matched = [row for row in timeline if row.get("status") in ACCEPTED_VISUAL_STATUSES]
     high = [row for row in timeline if row.get("confidence") == "high"]
-    low_or_review = [row for row in timeline if row.get("confidence") == "low" or row.get("status") != "matched"]
+    review = [
+        row
+        for row in timeline
+        if row.get("confidence") == "low" or row.get("status") not in ACCEPTED_VISUAL_STATUSES
+    ]
     backward_count = 0
     duplicate_count = 0
+    previous_start: float | None = None
     seen: set[str] = set()
-    prev_start: float | None = None
     for row in timeline:
         movie_start = row.get("movie_start")
-        if movie_start is not None and prev_start is not None and float(movie_start) < prev_start - 0.5:
-            backward_count += 1
         if movie_start is not None:
-            prev_start = float(movie_start)
+            current_start = float(movie_start)
+            if previous_start is not None and current_start < previous_start - 0.5:
+                backward_count += 1
+            previous_start = current_start
         for shot_id in row.get("movie_shot_ids") or []:
-            shot_id = str(shot_id)
             if shot_id in seen:
                 duplicate_count += 1
             seen.add(shot_id)
+    total = len(timeline)
     return {
         "total_ref_shots": total,
         "matched_count": len(matched),
         "matched_rate": round(len(matched) / max(1, total), 4),
         "high_confidence_count": len(high),
         "high_confidence_rate": round(len(high) / max(1, total), 4),
-        "manual_review_count": len(low_or_review),
+        "manual_review_count": len(review),
         "timeline_backward_count": backward_count,
         "duplicate_movie_shot_count": duplicate_count,
     }
 
 
-def export_matched_shot_clips(
+def _clear_directory_children(path: Path, output_root: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    resolved_path = path.resolve()
+    resolved_root = output_root.resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise RuntimeError(f"Refusing to clear directory outside output root: {path}") from exc
+    if resolved_path == resolved_root:
+        raise RuntimeError(f"Refusing to clear output root directly: {path}")
+    for item in path.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
+
+
+def export_review_artifacts(
     timeline: list[dict[str, Any]],
-    ref_video_path: str | Path | None,
-    movie_video_path: str | Path | None,
-    out_dir: str | Path,
+    ref_clips: list[ShotClip],
+    movie_clips: list[ShotClip],
+    output_root: Path,
     *,
-    ratio: float = 1.0,
-    progress_callback: Callable[[float, str], None] | None = None,
-) -> int:
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    ratio = min(1.0, max(0.0, float(ratio)))
-    if not timeline:
-        return 0
-    count = len(timeline) if ratio >= 1.0 else max(1, math.ceil(len(timeline) * ratio))
-    selected = timeline[:count]
-    exported = 0
-    for idx, item in enumerate(selected, start=1):
-        ref_id = str(item.get("ref_shot_id") or f"ref_{idx:03d}")
-        sub_dir = out / ref_id
-        sub_dir.mkdir(parents=True, exist_ok=True)
-        if ref_video_path:
-            cut_clip(
-                ref_video_path,
-                float(item.get("ref_start") or 0.0),
-                float(item.get("ref_end") or 0.0),
-                sub_dir / f"{ref_id}_ref.mp4",
-            )
-        movie_start = item.get("movie_start")
-        movie_end = item.get("movie_end")
-        if movie_video_path and movie_start is not None and movie_end is not None:
-            movie_id = (item.get("movie_shot_ids") or ["movie"])[0]
-            cut_clip(
-                movie_video_path,
-                float(movie_start),
-                float(movie_end),
-                sub_dir / f"{movie_id}_movie.mp4",
-            )
-        exported += 1
-        if progress_callback:
-            progress_callback(100, f"Exported matched shot clips {idx}/{len(selected)} ({ref_id})")
-    return exported
+    low_score_threshold: float,
+    min_geometry_inliers: int,
+) -> None:
+    output_root.mkdir(parents=True, exist_ok=True)
+    pair_root = output_root / "pairs"
+    low_conf_root = output_root / "low_confidence_pairs"
+    _clear_directory_children(pair_root, output_root)
+    _clear_directory_children(low_conf_root, output_root)
+
+    ref_by_id = {clip.shot_id: clip for clip in ref_clips}
+    movie_by_id = {clip.shot_id: clip for clip in movie_clips}
+    match_rows: list[dict[str, Any]] = []
+    for ref_index, row in enumerate(timeline):
+        ref_clip = ref_by_id.get(str(row.get("ref_shot_id") or ""))
+        movie_ids = [str(value) for value in row.get("movie_shot_ids") or []]
+        movie_clip = movie_by_id.get(movie_ids[0]) if movie_ids else None
+        if not ref_clip or not ref_clip.path or not movie_clip or not movie_clip.path:
+            continue
+
+        score = float(row.get("match_score") or 0.0)
+        folder_name = f"{ref_index + 1:04d}_{ref_clip.shot_id}__{movie_clip.shot_id}__{score:.4f}"
+        target_dir = pair_root / folder_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ref_clip.path, target_dir / f"reference{ref_clip.path.suffix.lower()}")
+        shutil.copy2(movie_clip.path, target_dir / f"movie{movie_clip.path.suffix.lower()}")
+        write_json(target_dir / "match.json", row)
+
+        geometry_inliers = int((row.get("diagnostics") or {}).get("geometry_inliers") or 0)
+        if score < low_score_threshold or geometry_inliers < min_geometry_inliers:
+            low_target_dir = low_conf_root / folder_name
+            shutil.copytree(target_dir, low_target_dir)
+
+        candidates = row.get("candidates") or []
+        match_row: dict[str, Any] = {
+            "ref_index": ref_index,
+            "ref_name": ref_clip.path.name,
+            "movie_index": movie_clip.index,
+            "movie_name": movie_clip.path.name,
+            "score": score,
+            "ref_duration": ref_clip.duration,
+            "movie_duration": movie_clip.duration,
+            "status": row.get("status"),
+            "confidence": row.get("confidence"),
+            "geometry_inliers": geometry_inliers,
+            "good_matches": int((row.get("diagnostics") or {}).get("good_matches") or 0),
+        }
+        for candidate_index in range(3):
+            prefix = f"top{candidate_index + 1}"
+            candidate = candidates[candidate_index] if candidate_index < len(candidates) else {}
+            match_row[f"{prefix}_movie_shot_id"] = candidate.get("movie_shot_id", "")
+            match_row[f"{prefix}_score"] = candidate.get("final_score", "")
+        match_rows.append(match_row)
+
+    fieldnames = [
+        "ref_index", "ref_name", "movie_index", "movie_name", "score",
+        "ref_duration", "movie_duration", "status", "confidence",
+        "geometry_inliers", "good_matches",
+        "top1_movie_shot_id", "top1_score", "top2_movie_shot_id", "top2_score",
+        "top3_movie_shot_id", "top3_score",
+    ]
+    with (output_root / "matches.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(match_rows)
+    write_json(output_root / "matches.json", match_rows)
+
+
+def write_low_confidence_report(output_dir: str | Path, timeline: list[dict[str, Any]]) -> Path:
+    items = [
+        {
+            "ref_shot_id": row.get("ref_shot_id"),
+            "status": row.get("status"),
+            "confidence": row.get("confidence"),
+            "match_score": row.get("match_score"),
+            "movie_shot_ids": row.get("movie_shot_ids") or [],
+            "diagnostics": row.get("diagnostics") or {},
+        }
+        for row in timeline
+        if row.get("confidence") == "low" or row.get("status") not in ACCEPTED_VISUAL_STATUSES
+    ]
+    return write_json(Path(output_dir) / "low_confidence_report.json", {"items": items})
 
 
 def align_visual_timeline(
-    ref_shots: list[dict[str, Any]],
-    movie_shots: list[dict[str, Any]],
+    ref_analysis: dict[str, Any],
+    movie_data: dict[str, Any],
     *,
-    top_n: int = 8,
+    ref_clip_dir: str | Path,
+    movie_clip_dir: str | Path,
+    output_dir: str | Path | None = None,
+    sample_count: int = 6,
+    frame_size: int = 384,
+    workers: int = 4,
+    neighbor_radius: int = 2,
+    candidate_count: int = 30,
     min_score: float = 0.35,
-    keyframes_per_shot: int = 4,
-    recall_top_k: int = 80,
-    rerank_top_k: int = 20,
-    refine_top_k: int = 3,
-    feature_mode: str = "classic",
-    alignment_mode: str = "temporal",
-    temporal_radius_sec: float = 1.5,
-    temporal_step_sec: float = 1.0,
-    neighbor_shot_window: int = 1,
-    spatial_normalize: str = "auto",
-    device: str = "auto",
-    feature_cache_dir: str | Path | None = None,
-    save_debug_boards: bool = False,
-    disable_global_path: bool = False,
+    low_score_threshold: float = 0.35,
+    min_geometry_inliers: int = 20,
+    top_k: int = 3,
     manual_overrides: dict[str, str] | None = None,
     diagnostics_dir: str | Path | None = None,
-    ref_video_path: str | Path | None = None,
-    movie_video_path: str | Path | None = None,
+    export_pairs: bool = True,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
-    if feature_mode not in {"classic", "classic_clip"}:
-        raise ValueError(f"不支持的 feature_mode: {feature_mode}")
-    if alignment_mode not in {"classic", "temporal", "spatial_temporal", "topiq_temporal"}:
-        raise ValueError(f"Unsupported alignment_mode: {alignment_mode}")
-    if spatial_normalize not in {"auto", "off"}:
-        raise ValueError(f"Unsupported spatial_normalize: {spatial_normalize}")
+    ref_rows = _rows(ref_analysis, "ref_shots")
+    movie_rows = _rows(movie_data, "movie_shots")
+    if not ref_rows:
+        raise RuntimeError("ref_analysis.json is missing ref_shots")
+    if not movie_rows:
+        raise RuntimeError("movie_shots.json is missing movie_shots")
 
-    effective_feature_mode = "classic"
-    embedding_status = "disabled"
-    if feature_mode == "classic_clip":
-        embedding_status = "not_configured_fallback_to_classic"
-    effective_alignment_mode = alignment_mode
-    alignment_status = "enabled"
-    if alignment_mode == "topiq_temporal":
-        effective_alignment_mode = "temporal"
-        alignment_status = "topiq_not_configured_fallback_to_temporal"
-
-    movie_features: list[dict[str, Any]] = []
-    total_movie = len(movie_shots)
-    for idx, shot in enumerate(movie_shots, start=1):
-        movie_features.append(
-            build_shot_feature(shot, max_frames=keyframes_per_shot, feature_mode=effective_feature_mode)
+    ref_clips = build_shot_clips(ref_rows, clip_dir=ref_clip_dir, id_key="ref_shot_id")
+    all_movie_clips = build_shot_clips(movie_rows, clip_dir=movie_clip_dir, id_key="movie_shot_id")
+    active_ref_clips = [clip for clip in ref_clips if _has_feature_source(clip)]
+    movie_clips = [clip for clip in all_movie_clips if _has_feature_source(clip)]
+    if not active_ref_clips:
+        raise RuntimeError(
+            f"No reference shot clips found in {ref_clip_dir}, and ref_analysis.json has no usable keyframes"
         )
-        if idx == 1 or idx == total_movie or idx % 20 == 0:
-            _progress(
-                progress_callback,
-                5.0 + (idx / max(1, total_movie)) * 25.0,
-                f"Indexed movie shot features {idx}/{total_movie}",
-            )
-
-    ref_features: list[dict[str, Any]] = []
-    candidates_by_ref: list[list[dict[str, Any]]] = []
-    total_ref = len(ref_shots)
-    for ref_index, ref in enumerate(ref_shots, start=1):
-        ref_feature = build_shot_feature(ref, max_frames=keyframes_per_shot, feature_mode=effective_feature_mode)
-        ref_features.append(ref_feature)
-        candidates = build_candidates(
-            ref_feature,
-            movie_features,
-            movie_shots,
-            recall_top_k=recall_top_k,
-            rerank_top_k=rerank_top_k,
-        )
-        if effective_alignment_mode != "classic":
-            if ref_index == 1 or ref_index == total_ref or ref_index % 5 == 0:
-                _progress(
-                    progress_callback,
-                    30.0 + (ref_index / max(1, total_ref)) * 55.0,
-                    f"Refining {effective_alignment_mode} candidates {ref_index}/{total_ref}",
-                )
-            candidates = refine_candidates_for_ref(
-                ref,
-                candidates,
-                movie_shots,
-                alignment_mode=effective_alignment_mode,
-                refine_top_k=refine_top_k,
-                temporal_radius_sec=temporal_radius_sec,
-                temporal_step_sec=temporal_step_sec,
-                neighbor_shot_window=neighbor_shot_window,
-                spatial_normalize=spatial_normalize,
-                ref_video_path=ref_video_path,
-                movie_video_path=movie_video_path,
-                feature_cache_dir=feature_cache_dir,
-                debug_dir=(Path(diagnostics_dir) / "debug_boards") if diagnostics_dir and save_debug_boards else None,
-            )
-        candidates_by_ref.append(candidates)
-        if ref_index == 1 or ref_index == total_ref or ref_index % 10 == 0:
-            _progress(
-                progress_callback,
-                30.0 + (ref_index / max(1, total_ref)) * 55.0,
-                f"Recalled and reranked candidates {ref_index}/{total_ref}",
-            )
-
-    _progress(progress_callback, 88.0, "Solving visual alignment path")
-    if disable_global_path:
-        chosen_path = solve_greedy_path(ref_shots, candidates_by_ref)
-        match_type = "temporal_continuity"
-    else:
-        chosen_path = solve_segmented_global_path(ref_shots, candidates_by_ref, min_visual_score=min_score)
-        match_type = (
-            "segmented_global_path"
-            if effective_alignment_mode == "classic"
-            else f"{effective_alignment_mode}_segmented_global_path"
+    if not movie_clips:
+        raise RuntimeError(
+            f"No movie shot clips found in {movie_clip_dir}, and movie_shots.json has no usable keyframes"
         )
 
-    movie_id_to_index = {_id(shot, "movie_shot_id"): idx for idx, shot in enumerate(movie_shots)}
-    manual_overrides = manual_overrides or {}
+    _progress(progress_callback, 2.0, f"Scanned {len(ref_clips)} reference shots and {len(all_movie_clips)} movie shots")
+    _progress(progress_callback, 5.0, "Extracting reference shot features")
+    ref_features = _extract_features(
+        active_ref_clips,
+        sample_count=sample_count,
+        frame_size=frame_size,
+        workers=workers,
+        mask_text_bands=True,
+    )
+    _progress(progress_callback, 35.0, "Extracting movie shot features")
+    movie_features = _extract_features(
+        movie_clips,
+        sample_count=sample_count,
+        frame_size=frame_size,
+        workers=workers,
+        mask_text_bands=False,
+    )
+
+    _progress(progress_callback, 68.0, "Building global shot similarity matrix")
+    similarity = shot_localizer.cosine_matrix(ref_features, movie_features)
+    _progress(progress_callback, 72.0, "Localizing shots with ORB retrieval and geometric verification")
+    matches = shot_localizer.independent_localize(
+        ref_features,
+        movie_features,
+        similarity,
+        neighbor_radius,
+        candidate_count,
+        top_k,
+    )
+    match_by_ref_index = {
+        active_ref_clips[int(match["ref_index"])].index: match
+        for match in matches
+        if 0 <= int(match.get("ref_index", -1)) < len(active_ref_clips)
+    }
+
+    manual_count = 0
+    ref_feature_by_id = {
+        clip.shot_id: feature for clip, feature in zip(active_ref_clips, ref_features)
+    }
+    movie_feature_by_id = {
+        clip.shot_id: (index, feature)
+        for index, (clip, feature) in enumerate(zip(movie_clips, movie_features))
+    }
+    for ref_id, movie_id in (manual_overrides or {}).items():
+        ref_feature = ref_feature_by_id.get(ref_id)
+        movie_hit = movie_feature_by_id.get(movie_id)
+        ref_clip = next((clip for clip in active_ref_clips if clip.shot_id == ref_id), None)
+        if not ref_feature or not movie_hit or not ref_clip:
+            continue
+        movie_index, movie_feature = movie_hit
+        match_by_ref_index[ref_clip.index] = _manual_match(ref_feature, movie_feature, movie_index)
+        manual_count += 1
+
     timeline: list[dict[str, Any]] = []
-    for index, ref in enumerate(ref_shots):
-        candidate = chosen_path[index] if index < len(chosen_path) else None
-        candidates = candidates_by_ref[index] if index < len(candidates_by_ref) else []
-        ref_id = _id(ref, "ref_shot_id")
-        manual = False
-        if ref_id in manual_overrides:
-            override = _manual_candidate(
-                ref_features[index],
-                movie_features,
-                movie_shots,
-                movie_id_to_index,
-                manual_overrides[ref_id],
+    for ref_clip in ref_clips:
+        if not _has_feature_source(ref_clip):
+            timeline.append(
+                _timeline_item(
+                    ref_clip,
+                    None,
+                    movie_clips,
+                    min_score=min_score,
+                    min_geometry_inliers=min_geometry_inliers,
+                    top_k=top_k,
+                    reason="missing_reference_clip",
+                )
             )
-            if override:
-                candidate = override
-                candidates = _append_candidate_once(candidates, override)
-                manual = True
-
+            continue
+        match = match_by_ref_index.get(ref_clip.index)
         timeline.append(
-            build_timeline_item(
-                ref,
-                candidate,
-                candidates,
-                top_n=top_n,
+            _timeline_item(
+                ref_clip,
+                match,
+                movie_clips,
                 min_score=min_score,
-                match_type=match_type,
-                manual_override=manual,
+                min_geometry_inliers=min_geometry_inliers,
+                top_k=top_k,
+                reason=None if match else "localization_failed",
+                manual_override=bool((match or {}).get("manual_override")),
             )
         )
 
-    _progress(progress_callback, 96.0, "Writing alignment diagnostics")
     if diagnostics_dir:
+        _progress(progress_callback, 94.0, "Writing alignment diagnostics")
         write_low_confidence_report(diagnostics_dir, timeline)
+    if output_dir and export_pairs:
+        _progress(progress_callback, 96.0, "Exporting review clip pairs")
+        export_review_artifacts(
+            timeline,
+            ref_clips,
+            movie_clips,
+            Path(output_dir),
+            low_score_threshold=low_score_threshold,
+            min_geometry_inliers=min_geometry_inliers,
+        )
 
     return {
         "ref_to_movie_timeline": timeline,
         "metadata": {
             "algorithm_version": ALGORITHM_VERSION,
-            "feature_mode": effective_feature_mode,
-            "requested_feature_mode": feature_mode,
-            "embedding_status": embedding_status,
-            "keyframes_per_shot": int(keyframes_per_shot),
-            "recall_top_k": int(recall_top_k),
-            "rerank_top_k": int(rerank_top_k),
-            "refine_top_k": int(refine_top_k),
-            "output_top_n": int(top_n),
+            "localizer_module": "run_shot_match_localize.py",
+            "source": "segmented_shot_clips_or_keyframes",
+            "ref_clip_dir": str(ref_clip_dir),
+            "movie_clip_dir": str(movie_clip_dir),
+            "sample_count": int(sample_count),
+            "frame_size": int(frame_size),
+            "workers": int(workers),
+            "neighbor_radius": int(neighbor_radius),
+            "candidate_count": int(candidate_count),
+            "top_k": int(top_k),
             "min_score": float(min_score),
-            "alignment_mode": effective_alignment_mode,
-            "requested_alignment_mode": alignment_mode,
-            "alignment_status": alignment_status,
-            "temporal_radius_sec": float(temporal_radius_sec),
-            "temporal_step_sec": float(temporal_step_sec),
-            "neighbor_shot_window": int(neighbor_shot_window),
-            "spatial_normalize": spatial_normalize,
-            "device": device,
-            "feature_cache_dir": str(feature_cache_dir) if feature_cache_dir else None,
-            "debug_boards_enabled": bool(save_debug_boards),
-            "global_path_enabled": not disable_global_path,
-            "manual_override_count": len(manual_overrides),
+            "low_score_threshold": float(low_score_threshold),
+            "min_geometry_inliers": int(min_geometry_inliers),
+            "manual_override_count": manual_count,
+            "missing_reference_clip_count": len(ref_clips) - len(active_ref_clips),
+            "missing_movie_clip_count": len(all_movie_clips) - len(movie_clips),
+            "active_ref_shot_count": len(active_ref_clips),
+            "active_movie_shot_count": len(movie_clips),
+            "reference_keyframe_fallback_count": sum(clip.path is None for clip in active_ref_clips),
+            "movie_keyframe_fallback_count": sum(clip.path is None for clip in movie_clips),
+            "export_pairs": bool(export_pairs),
             "summary": _summary(timeline),
         },
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="画面定位模块")
-    parser.add_argument("--ref-analysis", required=True, help="参考解析 JSON")
-    parser.add_argument("--movie-shots", required=True, help="原电影镜头 JSON")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run shot matching and write the pipeline-compatible visual timeline.")
+    parser.add_argument("--ref-analysis", required=True, help="Stage 1 ref_analysis.json")
+    parser.add_argument("--movie-shots", required=True, help="Stage 3 movie_shots.json")
     parser.add_argument("--output-dir", default=str(default_output_dir("4_visual_alignment_engine")))
-    parser.add_argument("--top-n", type=int, default=8)
+    parser.add_argument("--reference-dir", type=Path, help="Directory containing reference shot clips")
+    parser.add_argument("--movie-dir", type=Path, help="Directory containing movie shot clips")
+    parser.add_argument("--sample-count", type=int, default=6)
+    parser.add_argument("--keyframes-per-shot", type=int, help="Compatibility alias for --sample-count")
+    parser.add_argument("--frame-size", type=int, default=384)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--neighbor-radius", "--neighbor-shot-window", dest="neighbor_radius", type=int, default=2)
+    parser.add_argument("--candidate-count", "--recall-top-k", dest="candidate_count", type=int, default=30)
+    parser.add_argument("--top-k", "--top-n", dest="top_k", type=int, default=3)
     parser.add_argument("--min-score", type=float, default=0.35)
-    parser.add_argument("--keyframes-per-shot", type=int, default=4)
-    parser.add_argument("--recall-top-k", type=int, default=80)
-    parser.add_argument("--rerank-top-k", type=int, default=20)
-    parser.add_argument("--refine-top-k", type=int, default=3)
-    parser.add_argument("--feature-mode", choices=["classic", "classic_clip"], default="classic")
-    parser.add_argument("--alignment-mode", choices=["classic", "temporal", "spatial_temporal", "topiq_temporal"], default="temporal")
-    parser.add_argument("--temporal-radius-sec", type=float, default=1.5)
-    parser.add_argument("--temporal-step-sec", type=float, default=1.0)
-    parser.add_argument("--neighbor-shot-window", type=int, default=1)
-    parser.add_argument("--spatial-normalize", choices=["auto", "off"], default="auto")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--low-score-threshold", type=float)
+    parser.add_argument("--min-geometry-inliers", type=int, default=20)
+    parser.add_argument("--manual-overrides")
+    parser.add_argument("--diagnostics-dir")
+    parser.add_argument("--no-export-pairs", action="store_true")
+
+    # Retained so older pipeline invocations do not break after switching localizers.
     parser.add_argument("--feature-cache-dir")
+    parser.add_argument("--feature-mode", default="shot_localize")
+    parser.add_argument("--alignment-mode", default="independent_localize")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--refine-window", type=int)
+    parser.add_argument("--context-radius", type=int)
+    parser.add_argument("--repeat-penalty", type=float)
+    parser.add_argument("--advance-bonus", type=float)
+    parser.add_argument("--max-repeat", type=int)
+    parser.add_argument("--rerank-top-n", "--rerank-top-k", dest="rerank_top_n", type=int)
+    parser.add_argument("--temporal-radius-sec", type=float)
+    parser.add_argument("--temporal-step-sec", type=float)
+    parser.add_argument("--spatial-normalize", default="auto")
     parser.add_argument("--save-debug-boards", action="store_true")
     parser.add_argument("--disable-global-path", action="store_true")
-    parser.add_argument("--manual-overrides", help="人工覆写 JSON")
-    parser.add_argument("--diagnostics-dir", help="诊断输出目录；默认写到 output-dir/diagnostics")
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    ref_data = read_json(args.ref_analysis)
-    movie_data = read_json(args.movie_shots)
+
+def main() -> None:
+    args = parse_args()
+    ref_analysis_path = Path(args.ref_analysis)
+    movie_shots_path = Path(args.movie_shots)
     output_dir = Path(args.output_dir)
     diagnostics_dir = Path(args.diagnostics_dir) if args.diagnostics_dir else output_dir / "diagnostics"
-    feature_cache_dir = Path(args.feature_cache_dir) if args.feature_cache_dir else output_dir / "cache"
+    sample_count = args.keyframes_per_shot if args.keyframes_per_shot is not None else args.sample_count
+    low_score_threshold = args.low_score_threshold if args.low_score_threshold is not None else args.min_score
+
     result = align_visual_timeline(
-        ref_data.get("ref_shots") or [],
-        movie_data.get("movie_shots") or [],
-        top_n=args.top_n,
+        _read_json_tolerant(ref_analysis_path),
+        _read_json_tolerant(movie_shots_path),
+        ref_clip_dir=args.reference_dir or ref_analysis_path.parent / "shot_clips",
+        movie_clip_dir=args.movie_dir or movie_shots_path.parent / "shot_clips",
+        output_dir=output_dir,
+        sample_count=sample_count,
+        frame_size=args.frame_size,
+        workers=args.workers,
+        neighbor_radius=args.neighbor_radius,
+        candidate_count=args.candidate_count,
         min_score=args.min_score,
-        keyframes_per_shot=args.keyframes_per_shot,
-        recall_top_k=args.recall_top_k,
-        rerank_top_k=args.rerank_top_k,
-        refine_top_k=args.refine_top_k,
-        feature_mode=args.feature_mode,
-        alignment_mode=args.alignment_mode,
-        temporal_radius_sec=args.temporal_radius_sec,
-        temporal_step_sec=args.temporal_step_sec,
-        neighbor_shot_window=args.neighbor_shot_window,
-        spatial_normalize=args.spatial_normalize,
-        device=args.device,
-        feature_cache_dir=feature_cache_dir,
-        save_debug_boards=args.save_debug_boards,
-        disable_global_path=args.disable_global_path,
+        low_score_threshold=low_score_threshold,
+        min_geometry_inliers=args.min_geometry_inliers,
+        top_k=args.top_k,
         manual_overrides=_load_manual_overrides(args.manual_overrides),
         diagnostics_dir=diagnostics_dir,
-        ref_video_path=ref_data.get("ref_video_path"),
-        movie_video_path=movie_data.get("movie_path"),
+        export_pairs=not args.no_export_pairs,
         progress_callback=lambda percent, message: emit_progress("alignment", percent, message),
     )
     out = write_json(output_dir / "ref_to_movie_timeline.json", result)
-    if EXPORT_MATCHED_SHOT_CLIPS:
-        exported = export_matched_shot_clips(
-            result["ref_to_movie_timeline"],
-            ref_data.get("ref_video_path"),
-            movie_data.get("movie_path"),
-            output_dir / MATCHED_SHOT_CLIPS_DIRNAME,
-            ratio=MATCHED_SHOT_CLIPS_RATIO,
-            progress_callback=lambda percent, message: emit_progress("alignment", percent, message),
-        )
-        emit_progress("alignment", 100, f"Exported {exported} matched shot clip folders")
     emit_progress("alignment", 100, "Visual alignment complete")
     print(out)
 

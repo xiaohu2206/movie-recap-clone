@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -8,13 +9,29 @@ import cv2
 import numpy as np
 
 from .project_paths import MODEL_DIR
-from .video_tools import extract_frame, video_info
+from .video_tools import extract_frames, video_info
 
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[float, str], None]
 
 DEFAULT_KEYFRAME_POSITIONS = (0.2, 0.4, 0.6, 0.8)
+
+
+class ShotDetectionBackendUnavailable(RuntimeError):
+    pass
+
+
+def _acceleration_message(info: dict[str, Any]) -> str:
+    device = str(info.get("device") or "cpu").lower()
+    torch_version = str(info.get("torch_version") or "unknown")
+    if device.startswith("cuda"):
+        device_name = str(info.get("device_name") or "CUDA GPU")
+        cuda_version = str(info.get("cuda_version") or "unknown")
+        return f"TransNetV2 使用 GPU 加速: {device_name} (Torch {torch_version}, CUDA {cuda_version})"
+    fallback_reason = str(info.get("device_fallback_reason") or "").strip()
+    suffix = f"，GPU 回退原因: {fallback_reason}" if fallback_reason else ""
+    return f"TransNetV2 使用 CPU 推理 (Torch {torch_version}){suffix}"
 
 
 def _shot_id(prefix: str, idx: int) -> str:
@@ -78,22 +95,33 @@ def _detect_with_transnet(
     threshold: float,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[tuple[int, int]], int, dict[str, Any]]:
-    from .transnetv2_torch import TransNetV2Torch
+    try:
+        from .transnetv2_torch import TransNetV2Torch
+    except Exception as exc:
+        raise ShotDetectionBackendUnavailable(f"TransNetV2 unavailable: {exc}") from exc
 
     model = TransNetV2Torch(str(MODEL_DIR))
+    model_info = model.get_backend_info()
     if progress_callback:
-        progress_callback(1.0, "Loading TransNetV2 model")
+        progress_callback(1.0, _acceleration_message(model_info))
+    logger.info("[shot_detection] %s", _acceleration_message(model_info))
 
     def on_model_progress(percent: float) -> None:
         if progress_callback:
             progress_callback(2.0 + min(100.0, max(0.0, percent)) * 0.78, "Detecting shot boundaries")
 
     frames, single, many = model.predict_video(str(video_path), progress_callback=on_model_progress)
+    final_model_info = model.get_backend_info()
+    if str(final_model_info.get("device")) != str(model_info.get("device")):
+        fallback_message = f"TransNetV2 运行时已切换: {_acceleration_message(final_model_info)}"
+        if progress_callback:
+            progress_callback(81.0, fallback_message)
+        logger.warning("[shot_detection] %s", fallback_message)
     preds = many if many is not None and len(many) else single
     scenes = model.predictions_to_scenes(preds, threshold=threshold)
     if progress_callback:
         progress_callback(82.0, f"Detected {len(scenes)} raw shot boundaries")
-    return _normalize_scenes(scenes, len(frames), 2), len(frames), model.get_backend_info()
+    return _normalize_scenes(scenes, len(frames), 2), len(frames), final_model_info
 
 
 def _detect_with_frame_diff(
@@ -101,6 +129,9 @@ def _detect_with_frame_diff(
     threshold: float,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[tuple[int, int]], int, dict[str, Any]]:
+    if progress_callback:
+        progress_callback(1.0, "OpenCV 镜头检测使用 CPU")
+    logger.info("[shot_detection] OpenCV 镜头检测使用 CPU")
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
@@ -189,17 +220,33 @@ def detect_shots(
     max_sample_frames_per_shot: int = 0,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
+    total_started = time.perf_counter()
     info = video_info(video_path)
     fps = max(1e-6, float(info.get("fps") or 25.0))
     duration = float(info.get("duration") or 0.0)
     backend_info: dict[str, Any]
     if backend == "opencv":
         scenes, frame_count, backend_info = _detect_with_frame_diff(video_path, threshold, progress_callback)
+        backend_info["requested_backend"] = "opencv"
+    elif backend in {"auto", "transnet"}:
+        try:
+            scenes, frame_count, backend_info = _detect_with_transnet(video_path, threshold, progress_callback)
+        except ShotDetectionBackendUnavailable as exc:
+            if backend == "transnet":
+                raise
+            logger.warning("[shot_detection] TransNetV2 unavailable; falling back to OpenCV: %s", exc)
+            if progress_callback:
+                progress_callback(1.0, "TransNetV2 unavailable, falling back to OpenCV")
+            scenes, frame_count, backend_info = _detect_with_frame_diff(video_path, threshold, progress_callback)
+            backend_info["fallback_from"] = "transnet"
+            backend_info["fallback_reason"] = str(exc)[:500]
+        backend_info["requested_backend"] = backend
     else:
-        scenes, frame_count, backend_info = _detect_with_transnet(video_path, threshold, progress_callback)
+        raise ValueError(f"Unsupported shot detection backend: {backend}")
 
     min_frames = max(2, int(round(fps * 0.15)))
     scenes = _normalize_scenes(np.array(scenes, dtype=np.int32), frame_count, min_frames)
+    detection_seconds = time.perf_counter() - total_started
 
     key_dir = Path(keyframe_dir)
     key_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +257,7 @@ def detect_shots(
     if sample_fps > 0 and max_sample_frames_per_shot > 0:
         sample_dir.mkdir(parents=True, exist_ok=True)
     shots = []
+    frame_requests: list[tuple[float, Path]] = []
     total_scenes = len(scenes)
     if progress_callback:
         progress_callback(84.0, f"Exporting {total_scenes} keyframes")
@@ -224,7 +272,8 @@ def detect_shots(
         for keyframe_index, position in enumerate(positions):
             role = _keyframe_role(keyframe_index)
             time_sec = _time_at_position(start, end, position)
-            key_path = extract_frame(video_path, time_sec, key_dir / f"{sid}_{role}_{int(round(position * 100)):02d}.jpg")
+            key_path = key_dir / f"{sid}_{role}_{int(round(position * 100)):02d}.jpg"
+            frame_requests.append((time_sec, key_path))
             keyframes.append(str(key_path))
             keyframe_times.append(
                 {
@@ -239,7 +288,8 @@ def detect_shots(
         sample_frames: list[dict[str, Any]] = []
         if sample_fps > 0 and max_sample_frames_per_shot > 0:
             for sample_idx, time_sec in enumerate(_sample_times(start, end, sample_fps, max_sample_frames_per_shot), start=1):
-                sample_path = extract_frame(video_path, time_sec, sample_dir / f"{sid}_sample_{sample_idx:03d}.jpg")
+                sample_path = sample_dir / f"{sid}_sample_{sample_idx:03d}.jpg"
+                frame_requests.append((time_sec, sample_path))
                 sample_frames.append(
                     {
                         "path": str(sample_path),
@@ -260,9 +310,24 @@ def detect_shots(
                 "end_frame": int(end_f),
             }
         )
-        if progress_callback and (idx == 1 or idx == total_scenes or idx % 10 == 0):
-            percent = 84.0 + (idx / max(1, total_scenes)) * 16.0
-            progress_callback(percent, f"Exported keyframes {idx}/{total_scenes}")
+    keyframe_started = time.perf_counter()
+
+    def on_frame_progress(processed: int, total: int) -> None:
+        if progress_callback and (processed == 1 or processed == total or processed % 30 == 0):
+            percent = 84.0 + (processed / max(1, total)) * 16.0
+            progress_callback(percent, f"Exported frames {processed}/{total}")
+
+    extract_frames(video_path, frame_requests, fps=fps, progress_callback=on_frame_progress)
+    keyframe_seconds = time.perf_counter() - keyframe_started
+    timings = dict(backend_info.get("timings") or {})
+    timings.update(
+        {
+            "detection_seconds": round(detection_seconds, 3),
+            "keyframe_seconds": round(keyframe_seconds, 3),
+            "total_seconds": round(time.perf_counter() - total_started, 3),
+        }
+    )
+    backend_info["timings"] = timings
 
     return {
         "duration": round(duration, 3),

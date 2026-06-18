@@ -27,13 +27,16 @@ import {
 import "./styles.css";
 
 type RenderMode = "none" | "draft" | "video" | "both";
+type PipelineMode = "clone" | "ref_audio_rebuild";
 type BackendMode = "auto" | "transnet" | "opencv";
 type VideoEncoder = "auto" | "libx264" | "h264_nvenc";
 
 type PipelineConfig = {
+  pipelineMode: PipelineMode;
   refVideoPath: string;
   moviePath: string;
   subtitlePath: string;
+  movieSubtitlePath: string;
   outputRoot: string;
   asrProvider: "bcut" | "none";
   threshold: number;
@@ -51,11 +54,12 @@ type PipelineConfig = {
   videoEncoder: VideoEncoder;
 };
 
-type PipelineRunMode = "normal" | "resume" | "restart";
+type PipelineRunMode = "normal" | "resume" | "restart" | "render_only";
 
 type PipelineResumeState = {
   outputRoot: string;
   completedStages: string[];
+  configChanged?: boolean;
 };
 
 type StageState = "waiting" | "running" | "done" | "failed" | "skipped";
@@ -121,12 +125,36 @@ const stages: Stage[] = [
     patterns: ["4_visual_alignment_engine", "ref_to_movie_timeline.json"],
   },
   {
+    id: "ref_audio_rebuild",
+    step: 4.1,
+    title: "参考音频重组",
+    detail: "复用参考视频原音频，并替换为对齐后的原片画面。",
+    output: "outputs/4.1_ref_audio_rebuild_composer/ref_audio_rebuild_timeline.json",
+    patterns: ["4.1_ref_audio_rebuild_composer", "ref_audio_rebuild_timeline.json"],
+  },
+  {
     id: "binder",
     step: 5,
     title: "脚本画面绑定",
     detail: "为每段解说匹配可使用的原片画面。",
     output: "outputs/5_script_visual_binder/script_mapping.json",
     patterns: ["5_script_visual_binder", "script_mapping.json"],
+  },
+  {
+    id: "subtitle",
+    step: 5.1,
+    title: "原片字幕补充",
+    detail: "为绑定画面补充原片台词字幕。",
+    output: "outputs/5.1_movie_subtitle_filler/script_mapping_subtitled.json",
+    patterns: ["5.1_movie_subtitle_filler", "script_mapping_subtitled.json"],
+  },
+  {
+    id: "audio_role",
+    step: 5.2,
+    title: "原声判定",
+    detail: "判断每段使用 AI 配音还是保留原片原声。",
+    output: "outputs/5.2_audio_role_classifier/script_mapping_with_audio.json",
+    patterns: ["5.2_audio_role_classifier", "script_mapping_with_audio.json"],
   },
   {
     id: "rewrite",
@@ -155,9 +183,11 @@ const stages: Stage[] = [
 ];
 
 const defaultConfig: PipelineConfig = {
+  pipelineMode: "ref_audio_rebuild",
   refVideoPath: "",
   moviePath: "",
   subtitlePath: "",
+  movieSubtitlePath: "",
   outputRoot: "",
   asrProvider: "bcut",
   threshold: 0.5,
@@ -232,14 +262,67 @@ function outputPath(root: string, relative: string) {
   return `${root.replace(/[\\/]$/, "")}\\${relative.replace("outputs/", "").replace(/\//g, "\\")}`;
 }
 
-function isStageEnabled(stage: Stage, renderMode: RenderMode) {
-  return renderMode !== "none" || stage.id !== "render";
+function isStageEnabled(stage: Stage, renderMode: RenderMode, pipelineMode: PipelineMode) {
+  if (stage.id === "render") {
+    return renderMode !== "none";
+  }
+  if (pipelineMode === "ref_audio_rebuild") {
+    return ["reference", "shots", "alignment", "ref_audio_rebuild"].includes(stage.id);
+  }
+  return stage.id !== "ref_audio_rebuild";
 }
 
-function createStageStates(renderMode: RenderMode) {
+function createStageStates(renderMode: RenderMode, pipelineMode: PipelineMode) {
   return Object.fromEntries(
-    stages.map((stage) => [stage.id, isStageEnabled(stage, renderMode) ? "waiting" : "skipped"]),
+    stages.map((stage) => [stage.id, isStageEnabled(stage, renderMode, pipelineMode) ? "waiting" : "skipped"]),
   ) as Record<string, StageState>;
+}
+
+function stageStatesFromDisk(
+  completedIds: string[],
+  renderMode: RenderMode,
+  pipelineMode: PipelineMode,
+  options?: { runningStageId?: string; failedStageIds?: string[] },
+) {
+  const completed = new Set(completedIds);
+  const failed = new Set(options?.failedStageIds ?? []);
+  return Object.fromEntries(
+    stages.map((stage) => {
+      if (!isStageEnabled(stage, renderMode, pipelineMode)) {
+        return [stage.id, "skipped"];
+      }
+      if (failed.has(stage.id)) {
+        return [stage.id, "failed"];
+      }
+      if (options?.runningStageId === stage.id) {
+        return [stage.id, "running"];
+      }
+      if (completed.has(stage.id)) {
+        return [stage.id, "done"];
+      }
+      return [stage.id, "waiting"];
+    }),
+  ) as Record<string, StageState>;
+}
+
+function stageProgressFromDisk(completedIds: string[], renderMode: RenderMode, pipelineMode: PipelineMode) {
+  const completed = new Set(completedIds);
+  return Object.fromEntries(
+    stages.map((stage) => {
+      if (!isStageEnabled(stage, renderMode, pipelineMode)) {
+        return [stage.id, { percent: 0, message: "" }];
+      }
+      if (completed.has(stage.id)) {
+        return [stage.id, { percent: 100, message: "" }];
+      }
+      return [stage.id, { percent: 0, message: "" }];
+    }),
+  ) as Record<string, StageProgress>;
+}
+
+function firstIncompleteStageId(completedIds: string[], renderMode: RenderMode, pipelineMode: PipelineMode) {
+  const completed = new Set(completedIds);
+  return stages.find((stage) => isStageEnabled(stage, renderMode, pipelineMode) && !completed.has(stage.id))?.id;
 }
 
 function renderModeFromTargets(outputDraft: boolean, outputVideo: boolean): RenderMode {
@@ -262,6 +345,21 @@ function renderTargetsFromMode(renderMode: RenderMode) {
   };
 }
 
+function timelinePrereqStage(pipelineMode: PipelineMode) {
+  return pipelineMode === "ref_audio_rebuild" ? "ref_audio_rebuild" : "timeline";
+}
+
+function canRegenerateRender(
+  config: PipelineConfig,
+  diskCompletedStages: string[],
+  isRunning: boolean,
+) {
+  if (isRunning || config.renderMode === "none") {
+    return false;
+  }
+  return diskCompletedStages.includes(timelinePrereqStage(config.pipelineMode));
+}
+
 function App() {
   const [config, setConfig] = useState<PipelineConfig>(defaultConfig);
   const [backendInfo, setBackendInfo] = useState<BackendInfo | null>(null);
@@ -274,7 +372,7 @@ function App() {
   const [logLines, setLogLines] = useState<LogLine[]>([
     { id: 1, level: "system", text: "工作台已就绪。请选择参考视频和原片后启动流水线。" },
   ]);
-  const [stageStates, setStageStates] = useState<Record<string, StageState>>(() => createStageStates(defaultConfig.renderMode));
+  const [stageStates, setStageStates] = useState<Record<string, StageState>>(() => createStageStates(defaultConfig.renderMode, defaultConfig.pipelineMode));
   const [stageProgress, setStageProgress] = useState<Record<string, StageProgress>>({});
   const [aiTest, setAiTest] = useState<{ status: "idle" | "testing" | "ok" | "error"; message: string }>({
     status: "idle",
@@ -284,16 +382,22 @@ function App() {
     status: "idle",
     message: "",
   });
+  const [diskCompletedStages, setDiskCompletedStages] = useState<string[]>([]);
+  const diskCompletedStagesRef = useRef<string[]>([]);
   const nextLogId = useRef(2);
   const logRef = useRef<HTMLDivElement>(null);
   const configLoaded = useRef(false);
+
+  useEffect(() => {
+    diskCompletedStagesRef.current = diskCompletedStages;
+  }, [diskCompletedStages]);
 
   useEffect(() => {
     cloneBridge.getBackendInfo().then((info) => {
       setBackendInfo(info);
       setConfig((prev) => ({
         ...prev,
-        outputRoot: prev.outputRoot || `${info.root}\\outputs`,
+        outputRoot: prev.outputRoot || info.defaultOutputRoot || `${info.root}\\outputs`,
       }));
     });
 
@@ -303,8 +407,31 @@ function App() {
         setStartedAt(new Date());
         setFinishedCode(null);
         setPipelineLogPath(event.logPath || `${event.outputRoot}\\logs\\pipeline.log`);
-        setStageStates(createStageStates(config.renderMode));
-        setStageProgress({});
+        if (event.runMode === "render_only") {
+          const completed = event.completedStages?.length
+            ? event.completedStages
+            : diskCompletedStagesRef.current;
+          setStageStates(stageStatesFromDisk(completed, config.renderMode, config.pipelineMode, { runningStageId: "render" }));
+          setStageProgress({
+            ...stageProgressFromDisk(completed, config.renderMode, config.pipelineMode),
+            render: { percent: 0, message: "正在重新生成…" },
+          });
+        } else if (event.runMode === "resume") {
+          const completed = event.completedStages?.length
+            ? event.completedStages
+            : diskCompletedStagesRef.current;
+          const runningStageId = firstIncompleteStageId(completed, config.renderMode, config.pipelineMode);
+          setStageStates(
+            stageStatesFromDisk(completed, config.renderMode, config.pipelineMode, { runningStageId }),
+          );
+          setStageProgress(stageProgressFromDisk(completed, config.renderMode, config.pipelineMode));
+        } else if (event.runMode === "restart") {
+          setStageStates(createStageStates(config.renderMode, config.pipelineMode));
+          setStageProgress({});
+        } else {
+          setStageStates(createStageStates(config.renderMode, config.pipelineMode));
+          setStageProgress({});
+        }
         pushLog("system", `启动命令: ${event.command}`);
         pushLog("system", `输出目录: ${event.outputRoot}`);
       }
@@ -339,7 +466,7 @@ function App() {
             ) as Record<string, StageState>;
           }
           return Object.fromEntries(
-            stages.map((stage) => [stage.id, isStageEnabled(stage, config.renderMode) ? "done" : "skipped"]),
+                stages.map((stage) => [stage.id, isStageEnabled(stage, config.renderMode, config.pipelineMode) ? "done" : "skipped"]),
           ) as Record<string, StageState>;
         });
         if (event.code === 0) {
@@ -347,7 +474,7 @@ function App() {
             Object.fromEntries(
               stages.map((stage) => [
                 stage.id,
-                previous[stage.id] ?? { percent: isStageEnabled(stage, config.renderMode) ? 100 : 0, message: "" },
+                previous[stage.id] ?? { percent: isStageEnabled(stage, config.renderMode, config.pipelineMode) ? 100 : 0, message: "" },
               ]),
             ) as Record<string, StageProgress>,
           );
@@ -357,7 +484,7 @@ function App() {
     });
 
     return unsubscribe;
-  }, [config.renderMode]);
+  }, [config.renderMode, config.pipelineMode]);
 
   useEffect(() => {
     if (logRef.current) {
@@ -392,6 +519,48 @@ function App() {
     }, 400);
     return () => clearTimeout(timer);
   }, [config]);
+
+  useEffect(() => {
+    if (isRunning) {
+      return;
+    }
+    setStageStates((previous) =>
+      Object.fromEntries(
+        stages.map((stage) => {
+          if (!isStageEnabled(stage, config.renderMode, config.pipelineMode)) {
+            return [stage.id, "skipped"];
+          }
+          if (previous[stage.id] === "done" || previous[stage.id] === "failed") {
+            return [stage.id, previous[stage.id]];
+          }
+          return [stage.id, "waiting"];
+        }),
+      ) as Record<string, StageState>,
+    );
+  }, [config.renderMode, config.pipelineMode, isRunning]);
+
+  useEffect(() => {
+    if (!config.outputRoot) {
+      setDiskCompletedStages([]);
+      return;
+    }
+    let cancelled = false;
+    cloneBridge.getPipelineState(config).then((state) => {
+      if (!cancelled && state.ok) {
+        setDiskCompletedStages(state.completedStages);
+        if (!isRunning) {
+          setStageStates(stageStatesFromDisk(state.completedStages, config.renderMode, config.pipelineMode));
+          setStageProgress(stageProgressFromDisk(state.completedStages, config.renderMode, config.pipelineMode));
+          if (state.completed) {
+            setFinishedCode(0);
+          }
+        }
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [config.outputRoot, config.pipelineMode, config.renderMode, finishedCode, isRunning]);
 
   function pushLog(level: LogLine["level"], text: string) {
     const clean = text.trim();
@@ -445,15 +614,30 @@ function App() {
   }
 
   function markStageFromText(text: string) {
-    const marker = text.match(/\[pipeline\]\s+([1-8])_/);
-    const nextIndex = marker ? Number(marker[1]) - 1 : -1;
+    const skipped = text.match(/\[pipeline\]\s+([0-9]+(?:\.[0-9]+)?)_\S+\s+skipped\b/);
+    if (skipped) {
+      const step = Number(skipped[1]);
+      const stage = stages.find((item) => item.step === step);
+      if (stage && isStageEnabled(stage, config.renderMode, config.pipelineMode)) {
+        setStageStates((previous) => ({ ...previous, [stage.id]: "done" }));
+        setStageProgress((previous) => ({
+          ...previous,
+          [stage.id]: { percent: 100, message: "已复用已有产物" },
+        }));
+      }
+      return;
+    }
+
+    const marker = text.match(/\[pipeline\]\s+([0-9]+(?:\.[0-9]+)?)_\S+\s+->/);
+    const step = marker ? Number(marker[1]) : NaN;
+    const nextIndex = Number.isFinite(step) ? stages.findIndex((stage) => stage.step === step) : -1;
     if (nextIndex < 0) {
       return;
     }
     setStageStates((previous) => {
       return Object.fromEntries(
         stages.map((stage, index) => {
-          if (!isStageEnabled(stage, config.renderMode)) {
+          if (!isStageEnabled(stage, config.renderMode, config.pipelineMode)) {
             return [stage.id, "skipped"];
           }
           if (previous[stage.id] === "failed") {
@@ -465,7 +649,7 @@ function App() {
           if (index === nextIndex) {
             return [stage.id, "running"];
           }
-          return [stage.id, "waiting"];
+          return [stage.id, previous[stage.id] === "done" ? "done" : "waiting"];
         }),
       ) as Record<string, StageState>;
     });
@@ -507,10 +691,10 @@ function App() {
     }
   }
 
-  async function chooseSubtitle() {
-    const selected = await cloneBridge.selectFile({ title: "选择字幕文件", filters: subtitleFilters });
+  async function chooseSubtitle(key: "subtitlePath" | "movieSubtitlePath", title = "选择字幕文件") {
+    const selected = await cloneBridge.selectFile({ title, filters: subtitleFilters });
     if (selected) {
-      updateConfig("subtitlePath", selected);
+      updateConfig(key, selected);
     }
   }
 
@@ -548,6 +732,11 @@ function App() {
 
     setActiveTab("pipeline");
     setResumeState(null);
+    if (runMode === "resume") {
+      pushLog("system", "继续生成：复用已有阶段产物。");
+    } else if (runMode === "restart") {
+      pushLog("system", "重新生成：清理阶段产物并从头开始。");
+    }
     const result = await cloneBridge.startPipeline({ ...config, runMode });
     if (!result.ok) {
       pushLog("error", result.error || "启动失败。");
@@ -557,6 +746,11 @@ function App() {
   }
 
   async function handleStartClick() {
+    if (config.pipelineMode === "clone" && !config.aiApiKey.trim()) {
+      pushLog("error", "仿写克隆模式需填写 API Key。");
+      return;
+    }
+
     if (!config.refVideoPath || !config.moviePath) {
       await startPipeline();
       return;
@@ -567,11 +761,40 @@ function App() {
       setResumeState({
         outputRoot: state.outputRoot,
         completedStages: state.completedStages,
+        configChanged: Boolean(state.configChanged),
       });
       return;
     }
 
     await startPipeline("normal");
+  }
+
+  async function regenerateRender() {
+    if (isRunning) {
+      return;
+    }
+
+    if (config.renderMode === "none") {
+      pushLog("error", "请至少勾选「生成剪映草稿」或「生成视频」。");
+      setActiveTab("setup");
+      return;
+    }
+
+    if ((config.renderMode === "draft" || config.renderMode === "both") && !config.jianyingDraftDir) {
+      pushLog("error", "生成剪映草稿需先设置剪映草稿目录。");
+      setActiveTab("setup");
+      return;
+    }
+
+    setActiveTab("pipeline");
+    setResumeState(null);
+    pushLog("system", "仅重新执行第 8 步，复用已有时间线与配音。");
+    const result = await cloneBridge.startPipeline({ ...config, runMode: "render_only" });
+    if (!result.ok) {
+      pushLog("error", result.error || "重新生成失败。");
+    } else if (result.logPath) {
+      setPipelineLogPath(result.logPath);
+    }
   }
 
   async function stopPipeline() {
@@ -597,15 +820,19 @@ function App() {
   }
 
   const renderTargets = renderTargetsFromMode(config.renderMode);
-  const activeStageCount = useMemo(() => stages.filter((stage) => isStageEnabled(stage, config.renderMode)).length, [config.renderMode]);
+  const activeStages = useMemo(
+    () => stages.filter((stage) => isStageEnabled(stage, config.renderMode, config.pipelineMode)),
+    [config.renderMode, config.pipelineMode],
+  );
+  const activeStageCount = activeStages.length;
   const completedCount = useMemo(
-    () => stages.filter((stage) => isStageEnabled(stage, config.renderMode) && stageStates[stage.id] === "done").length,
-    [config.renderMode, stageStates],
+    () => activeStages.filter((stage) => stageStates[stage.id] === "done").length,
+    [activeStages, stageStates],
   );
   const progressUnits = useMemo(
     () =>
       stages.reduce((sum, stage) => {
-        if (!isStageEnabled(stage, config.renderMode)) {
+        if (!isStageEnabled(stage, config.renderMode, config.pipelineMode)) {
           return sum;
         }
         if (stageStates[stage.id] === "done") {
@@ -616,15 +843,25 @@ function App() {
         }
         return sum;
       }, 0),
-    [config.renderMode, stageProgress, stageStates],
+    [config.renderMode, config.pipelineMode, stageProgress, stageStates],
   );
-  const progress = Math.round((progressUnits / activeStageCount) * 100);
-  const canStart = config.refVideoPath && config.moviePath && !isRunning;
+  const progress = Math.round((progressUnits / Math.max(1, activeStageCount)) * 100);
+  const isRefAudioRebuild = config.pipelineMode === "ref_audio_rebuild";
+  const hasAiApiKey = Boolean(config.aiApiKey.trim());
+  const canStart =
+    Boolean(config.refVideoPath && config.moviePath && !isRunning) &&
+    (isRefAudioRebuild || hasAiApiKey);
+  const startDisabledReason = !config.refVideoPath || !config.moviePath
+    ? "请先选择参考视频和原片素材"
+    : !isRefAudioRebuild && !hasAiApiKey
+      ? "仿写克隆模式需填写 API Key"
+      : undefined;
 
   const videoOutputFullPath = outputPath(config.outputRoot, "outputs/8_generate_video");
   const jianyingDraftFullPath = config.jianyingDraftDir
     ? config.jianyingDraftDir
     : outputPath(config.outputRoot, "outputs/8_generate_video/jianying_drafts");
+  const showRenderRegenerate = canRegenerateRender(config, diskCompletedStages, isRunning);
 
   return (
     <div className="app-shell">
@@ -672,11 +909,50 @@ function App() {
 
       <main className="main-panel">
         <header className="topbar">
-          <div>
-            <p className="kicker">Production pipeline</p>
-            <h1>从参考解说到可交付视频，一次跑完整条链路。</h1>
+          <div className="topbar-hero">
+            <p className="kicker kicker-fancy">
+              <Sparkle weight="fill" />
+              AI Production · 全流程自动化
+            </p>
+            <h1 className="topbar-hero-title">
+              <span className="hero-title-gradient">解说克隆</span>
+              <span className="hero-title-shine" aria-hidden="true" />
+            </h1>
+            <p className="topbar-hero-tagline">从参考解说到可交付视频，一次跑完整条链路。</p>
           </div>
           <div className="topbar-actions">
+            <div className="pipeline-mode-switch" role="radiogroup" aria-label="生成模式">
+              <span className="pipeline-mode-switch-label">生成模式</span>
+              <div className="pipeline-mode-segments">
+                <label
+                  className={cx("pipeline-mode-segment", config.pipelineMode === "clone" && "active")}
+                  title="重写文案并生成新解说视频"
+                >
+                  <input
+                    type="radio"
+                    name="pipelineMode"
+                    checked={config.pipelineMode === "clone"}
+                    disabled={isRunning}
+                    onChange={() => updateConfig("pipelineMode", "clone")}
+                  />
+                  <span>仿写克隆</span>
+                </label>
+                <label
+                  className={cx("pipeline-mode-segment", isRefAudioRebuild && "active")}
+                  title="保留参考原声并替换为原片画面"
+                >
+                  <input
+                    type="radio"
+                    name="pipelineMode"
+                    checked={isRefAudioRebuild}
+                    disabled={isRunning}
+                    onChange={() => updateConfig("pipelineMode", "ref_audio_rebuild")}
+                  />
+                  <span>画面重组</span>
+                </label>
+              </div>
+            </div>
+            <div className="topbar-action-divider" aria-hidden="true" />
             <button className="ghost-button" onClick={() => setConfig(defaultConfig)} disabled={isRunning}>
               <ArrowCounterClockwise /> 重置
             </button>
@@ -685,7 +961,12 @@ function App() {
                 <Stop weight="fill" /> 停止
               </button>
             ) : (
-              <button className="primary-button" onClick={handleStartClick} disabled={!canStart}>
+              <button
+                className="primary-button"
+                onClick={handleStartClick}
+                disabled={!canStart}
+                title={startDisabledReason}
+              >
                 <Play weight="fill" /> 开始生成
               </button>
             )}
@@ -701,6 +982,9 @@ function App() {
                 <p>
                   已在当前输出目录找到 {resumeState.completedStages.length} 个阶段产物。继续生成会复用已有产物，重新生成会清理阶段产物并从头开始。
                 </p>
+                {resumeState.configChanged && (
+                  <p className="resume-dialog-warning">检测到项目配置已变更，继续生成仍会复用已有阶段产物。</p>
+                )}
                 <small>{resumeState.outputRoot}</small>
               </div>
               <div className="resume-dialog-actions">
@@ -751,8 +1035,17 @@ function App() {
                   value={config.subtitlePath}
                   description="可选。提供 srt 会跳过 ASR，速度更快。"
                   actionLabel="选择字幕"
-                  onChoose={chooseSubtitle}
+                  onChoose={() => chooseSubtitle("subtitlePath", "选择参考字幕")}
                   onClear={() => updateConfig("subtitlePath", "")}
+                />
+                <AssetPicker
+                  icon={<File />}
+                  title="原片字幕"
+                  value={config.movieSubtitlePath}
+                  description="可选。提供 srt 可跳过原片 ASR，并用于原声判定。"
+                  actionLabel="选择字幕"
+                  onChoose={() => chooseSubtitle("movieSubtitlePath", "选择原片字幕")}
+                  onClear={() => updateConfig("movieSubtitlePath", "")}
                 />
               </div>
             </div>
@@ -760,7 +1053,7 @@ function App() {
             <div className="panel">
               <div className="panel-heading compact">
                 <div>
-                  <p className="section-label">生成模式</p>
+                  <p className="section-label">输出配置</p>
                   <h2>输出目标</h2>
                 </div>
               </div>
@@ -857,6 +1150,7 @@ function App() {
               )}
             </div>
 
+            {!isRefAudioRebuild && (
             <div className="panel">
               <div className="panel-heading compact">
                 <div>
@@ -866,11 +1160,11 @@ function App() {
               </div>
               <div className="form-stack">
                 <label>
-                  API Key
+                  API Key <span className="field-required">必填</span>
                   <input
                     type="password"
                     value={config.aiApiKey}
-                    placeholder="可留空，使用环境变量"
+                    placeholder="仿写克隆模式需填写 OpenAI 兼容 API Key"
                     onChange={(event) => updateConfig("aiApiKey", event.target.value)}
                   />
                 </label>
@@ -896,18 +1190,21 @@ function App() {
                 </div>
               </div>
             </div>
+            )}
 
             <div className="panel wide-panel">
               <div className="panel-heading">
                 <div>
                   <p className="section-label">高级参数</p>
-                  <h2>性能、镜头识别与配音</h2>
+                  <h2>{isRefAudioRebuild ? "性能与镜头识别" : "性能、镜头识别与配音"}</h2>
                 </div>
               </div>
               <div className="settings-grid">
                 <SelectField label="镜头后端" value={config.backend} onChange={(value) => updateConfig("backend", value as BackendMode)} options={["auto", "transnet", "opencv"]} />
                 <SelectField label="视频编码" value={config.videoEncoder} onChange={(value) => updateConfig("videoEncoder", value as VideoEncoder)} options={["auto", "libx264", "h264_nvenc"]} />
                 <NumberField label="镜头阈值" value={config.threshold} min={0.1} max={0.9} step={0.05} onChange={(value) => updateConfig("threshold", value)} />
+                {!isRefAudioRebuild && (
+                  <>
                 <NumberField label="AI 温度" value={config.aiTemperature} min={0} max={1.5} step={0.1} onChange={(value) => updateConfig("aiTemperature", value)} />
                 <NumberField label="每秒字数" value={config.charsPerSecond} min={2} max={8} step={0.1} onChange={(value) => updateConfig("charsPerSecond", value)} />
                 <NumberField label="配音速度" value={config.edgeTtsSpeed} min={0.5} max={2} step={0.05} onChange={(value) => updateConfig("edgeTtsSpeed", value)} />
@@ -915,6 +1212,8 @@ function App() {
                   Edge Voice ID
                   <input value={config.edgeVoiceId} onChange={(event) => updateConfig("edgeVoiceId", event.target.value)} />
                 </label>
+                  </>
+                )}
               </div>
             </div>
           </section>
@@ -923,13 +1222,15 @@ function App() {
         {activeTab === "pipeline" && (
           <section className="pipeline-layout">
             <div className="stage-list">
-              {stages.map((stage) => (
+              {activeStages.map((stage) => (
                 <StageRow
                   key={stage.id}
                   stage={stage}
                   state={stageStates[stage.id]}
                   progress={stageProgress[stage.id]}
                   targetPath={outputPath(config.outputRoot, stage.output)}
+                  showRegenerate={stage.id === "render" && showRenderRegenerate}
+                  onRegenerate={regenerateRender}
                 />
               ))}
             </div>
@@ -1081,11 +1382,15 @@ function StageRow({
   state,
   progress,
   targetPath,
+  showRegenerate = false,
+  onRegenerate,
 }: {
   stage: Stage;
   state: StageState;
   progress?: StageProgress;
   targetPath: string;
+  showRegenerate?: boolean;
+  onRegenerate?: () => void;
 }) {
   const icon = {
     waiting: <ClockCounterClockwise />,
@@ -1116,9 +1421,20 @@ function StageRow({
             </div>
           )}
         </div>
-        <button onClick={() => cloneBridge.revealPath(targetPath)}>
-          <Export /> 定位产物
-        </button>
+        <div className="stage-actions">
+          {showRegenerate && onRegenerate && (
+            <button
+              className="stage-regenerate-button"
+              onClick={onRegenerate}
+              title="仅重新执行第 8 步，复用已有时间线与配音"
+            >
+              <ArrowCounterClockwise /> 重新生成
+            </button>
+          )}
+          <button onClick={() => cloneBridge.revealPath(targetPath)}>
+            <Export /> 定位产物
+          </button>
+        </div>
       </div>
       <div className="stage-state">
         {icon}
