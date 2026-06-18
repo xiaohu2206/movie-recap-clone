@@ -1,3 +1,9 @@
+
+
+## 软件版下载
+
+飞书下载入口：[点击下载](https://my.feishu.cn/wiki/NI0qwbHftith0kkxhHJcjGlJnRc?from=from_copylink)
+
 # clone_narration_video
 
 这是独立的影视解说克隆子项目。当前已实现十个流水线步骤：
