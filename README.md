@@ -391,13 +391,19 @@ python .\8_generate_video\run.py `
 输出：
 ```text
 outputs\8_generate_video\audio\
-outputs\8_generate_video\jianying_drafts\
-outputs\8_generate_video\clone_narration_output.mp4
+outputs\8_generate_video\shot_breakdown.json
+outputs\8_generate_video\clone_narration_output.mp4          # --mode video / both
 outputs\8_generate_video\generate_video_result.json
+%LOCALAPPDATA%\JianyingPro\User Data\Projects\com.lveditor.draft\  # --mode draft / both，剪映草稿目录
 ```
 
-使用参考音频画面重组时间线渲染：
+`--mode draft` 或 `both` 时，草稿会直接写入本机剪映/CapCut 草稿根目录（自动探测）。若未找到，通过 `--jianying-draft-dir` 指定；实际路径见 `generate_video_result.json` 中的 `jianying_draft.draft_dir`。
 
+### 使用参考音频画面重组时间线渲染
+
+这条分支会从参考视频中按 `external_audio.start/end` 切出音频片段，不会调用 TTS。
+
+同时生成剪映草稿和 mp4：
 ```powershell
 python .\8_generate_video\run.py `
   --timeline .\outputs\4.1_ref_audio_rebuild_composer\ref_audio_rebuild_timeline.json `
@@ -405,11 +411,42 @@ python .\8_generate_video\run.py `
   --ref-analysis .\outputs\1_reference_analyzer\ref_analysis.json `
   --output-root .\outputs `
   --mode both `
+  --draft-name RefAudioRebuild `
   --video-output-name ref_audio_rebuild_output.mp4 `
   --video-encoder auto
 ```
 
-这条命令会从参考视频中按 `external_audio.start/end` 切出音频片段，不会调用 TTS。
+只生成剪映草稿：
+```powershell
+python .\8_generate_video\run.py `
+  --timeline .\outputs\4.1_ref_audio_rebuild_composer\ref_audio_rebuild_timeline.json `
+  --output-dir .\outputs\8_generate_video `
+  --ref-analysis .\outputs\1_reference_analyzer\ref_analysis.json `
+  --output-root .\outputs `
+  --mode draft `
+  --draft-name RefAudioRebuild
+```
+
+只直接生成视频：
+```powershell
+python .\8_generate_video\run.py `
+  --timeline .\outputs\4.1_ref_audio_rebuild_composer\ref_audio_rebuild_timeline.json `
+  --output-dir .\outputs\8_generate_video `
+  --ref-analysis .\outputs\1_reference_analyzer\ref_analysis.json `
+  --output-root .\outputs `
+  --mode video `
+  --video-output-name ref_audio_rebuild_output.mp4 `
+  --video-encoder auto
+```
+
+输出：
+```text
+outputs\8_generate_video\audio\
+outputs\8_generate_video\shot_breakdown.json
+outputs\8_generate_video\ref_audio_rebuild_output.mp4          # --mode video / both
+outputs\8_generate_video\generate_video_result.json
+%LOCALAPPDATA%\JianyingPro\User Data\Projects\com.lveditor.draft\  # --mode draft / both
+```
 
 完整流水线最后也可以追加渲染：
 ```powershell

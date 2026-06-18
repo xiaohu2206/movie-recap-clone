@@ -124,17 +124,17 @@ class TimelineComposerTests(unittest.TestCase):
         self.assertEqual(shot_ids.count("movie_shot_001"), 1)
         self.assertNotIn("extended_with_adjacent_shots", [item.get("allocation_status") for item in items])
         self.assertTrue(
-            all(
-                float(clip["duration"]) >= timeline.MIN_ORIGINAL_PLAY_DURATION
-                for clip in clips
-                if clip.get("keep_original_audio")
+            any(
+                item["audio_type"] == "original_audio"
+                and item["segment_id"] == "seg_002"
+                and item.get("video_clips")
+                for item in items
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             any(
                 item["audio_type"] == "narration"
                 and item["segment_id"] == "seg_002"
-                and item.get("video_clips")
                 for item in items
             )
         )
@@ -143,6 +143,47 @@ class TimelineComposerTests(unittest.TestCase):
         movie_ends = [float(clip["movie_end"]) for clip in clips]
         for previous_end, next_start in zip(movie_ends, movie_starts[1:]):
             self.assertGreaterEqual(next_start + timeline.MOVIE_ROLLBACK_TOLERANCE, previous_end)
+
+    def test_compose_keeps_distinct_earlier_movie_matches(self) -> None:
+        result = timeline.compose_timeline(
+            [
+                {
+                    "segment_id": "seg_001",
+                    "new_text": "first",
+                    "audio_pattern": "all_narration",
+                    "movie_time_ranges": [
+                        {
+                            "start": 100.0,
+                            "end": 103.0,
+                            "movie_shot_ids": ["movie_shot_late"],
+                            "source_ref_shot_id": "ref_shot_001",
+                        }
+                    ],
+                },
+                {
+                    "segment_id": "seg_002",
+                    "new_text": "second",
+                    "audio_pattern": "all_narration",
+                    "movie_time_ranges": [
+                        {
+                            "start": 10.0,
+                            "end": 13.0,
+                            "movie_shot_ids": ["movie_shot_early"],
+                            "source_ref_shot_id": "ref_shot_002",
+                        }
+                    ],
+                },
+            ],
+            source="movie.mp4",
+            movie_shots_data={"movie_shots": []},
+            chars_per_second=10.0,
+            min_duration=1.0,
+        )
+
+        items = result["final_timeline"]
+        self.assertEqual(items[1]["allocation_status"], "trimmed_to_tts")
+        self.assertEqual(items[1]["video_clips"][0]["movie_shot_ids"], ["movie_shot_early"])
+        self.assertFalse(result["timeline_backend"]["prevent_movie_rollback"])
 
 
 if __name__ == "__main__":

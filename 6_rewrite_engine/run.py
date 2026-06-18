@@ -106,6 +106,13 @@ def _build_batch_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _is_connectivity_error(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    name = type(exc).__name__.lower()
+    return "connect" in name or "timeout" in name
+
+
 async def _call_ai_batch(
     provider: CustomOpenAIProvider,
     batch: list[dict[str, Any]],
@@ -120,7 +127,9 @@ async def _call_ai_batch(
             messages,
             extra_params={"response_format": {"type": "json_object"}},
         )
-    except Exception:
+    except Exception as exc:
+        if _is_connectivity_error(exc):
+            raise
         response = await provider.chat_completion(messages)
 
     parsed = _extract_json(response.content)
@@ -317,17 +326,20 @@ def main() -> None:
     if USE_LLM_REWRITE:
         if not args.api_key:
             raise SystemExit("缺少 AI API Key：请传 --api-key 或设置 CLONE_AI_API_KEY / OPENAI_API_KEY")
-        result = asyncio.run(
-            rewrite_script(
-                script_mapping,
-                api_key=args.api_key,
-                base_url=args.base_url,
-                model=args.model,
-                temperature=args.temperature,
-                batch_size=args.batch_size,
-                progress_callback=progress_callback,
+        try:
+            result = asyncio.run(
+                rewrite_script(
+                    script_mapping,
+                    api_key=args.api_key,
+                    base_url=args.base_url,
+                    model=args.model,
+                    temperature=args.temperature,
+                    batch_size=args.batch_size,
+                    progress_callback=progress_callback,
+                )
             )
-        )
+        except ConnectionError as exc:
+            raise SystemExit(str(exc)) from None
     else:
         result = pass_through_original_script(script_mapping, progress_callback=progress_callback)
     out = write_json(Path(args.output_dir) / "rewritten_script.json", result)

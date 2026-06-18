@@ -36,21 +36,10 @@ def _load_module(name: str, path: Path):
     return module
 
 
-refinement = _load_module("alignment_refinement_test", ROOT / "4_visual_alignment_engine" / "refinement.py")
-path_solver = _load_module("alignment_path_solver_test", ROOT / "4_visual_alignment_engine" / "path_solver.py")
+alignment = _load_module("alignment_run_test", ROOT / "4_visual_alignment_engine" / "run.py")
 
 
-def _write_image(path: Path, color: tuple[int, int, int], *, square: tuple[int, int] | None = None) -> str:
-    img = np.full((96, 128, 3), color, dtype=np.uint8)
-    if square:
-        x, y = square
-        cv2.rectangle(img, (x, y), (x + 28, y + 28), (255, 255, 255), -1)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(path), img)
-    return str(path)
-
-
-class VisualAlignmentV3Tests(unittest.TestCase):
+class VisualAlignmentTests(unittest.TestCase):
     def test_detect_shots_exports_three_keyframes_and_optional_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -185,52 +174,42 @@ class VisualAlignmentV3Tests(unittest.TestCase):
             score = compare_normalized_frames(img1, img2)["score"]
             self.assertGreater(score, 0.65)
 
-    def test_temporal_refinement_finds_best_offset(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            ref_frames = [
-                {"path": _write_image(root / "ref0.jpg", (20, 20, 20), square=(8, 20)), "time": 0.0},
-                {"path": _write_image(root / "ref1.jpg", (20, 20, 20), square=(40, 20)), "time": 1.0},
-            ]
-            movie_frames = [
-                {"path": _write_image(root / "movie0.jpg", (20, 20, 20), square=(8, 20)), "time": 9.5},
-                {"path": _write_image(root / "movie1.jpg", (20, 20, 20), square=(40, 20)), "time": 10.5},
-                {"path": _write_image(root / "movie2.jpg", (120, 20, 20), square=(60, 20)), "time": 11.0},
-            ]
-            ref = {"ref_shot_id": "ref_001", "start": 0.0, "end": 2.0, "sample_frames": ref_frames}
-            movie_shots = [
-                {
-                    "movie_shot_id": "movie_001",
-                    "start": 9.0,
-                    "end": 12.0,
-                    "sample_frames": movie_frames,
-                }
-            ]
-            candidates = [
-                {
-                    "movie_index": 0,
-                    "movie_shot_id": "movie_001",
-                    "movie_start": 9.0,
-                    "movie_end": 12.0,
-                    "visual_score": 0.45,
-                    "recall_score": 0.45,
-                    "detail": {},
-                }
-            ]
+    def test_shot_localizer_selects_best_matching_movie_clip(self) -> None:
+        def make_frame(color: tuple[int, int, int], square_x: int) -> np.ndarray:
+            frame = np.full((96, 128, 3), color, dtype=np.uint8)
+            cv2.rectangle(frame, (square_x, 28), (square_x + 30, 58), (255, 255, 255), -1)
+            return frame
 
-            refined = refinement.refine_candidates_for_ref(
-                ref,
-                candidates,
-                movie_shots,
-                alignment_mode="temporal",
-                refine_top_k=1,
-                temporal_radius_sec=1.0,
-                temporal_step_sec=0.5,
+        def make_feature(name: str, frames: list[np.ndarray]) -> object:
+            localizer = alignment.shot_localizer
+            frame_features = np.stack([localizer.frame_descriptor(frame) for frame in frames]).astype(np.float32)
+            return localizer.ShotFeature(
+                path=Path(name),
+                duration=1.0,
+                frame_features=frame_features,
+                clip_feature=localizer.normalize_vector(frame_features.mean(axis=0)),
+                local_features=[],
             )
 
-            self.assertEqual(refined[0]["movie_shot_id"], "movie_001")
-            self.assertGreater(refined[0]["refinement_score"], 0.85)
-            self.assertAlmostEqual(refined[0]["refinement"]["temporal_offset"], 9.5, delta=0.15)
+        ref = make_feature("ref_001.mp4", [make_frame((20, 30, 40), 12), make_frame((20, 30, 40), 62)])
+        wrong = make_feature("movie_wrong.mp4", [make_frame((170, 50, 50), 16), make_frame((170, 50, 50), 70)])
+        best = make_feature("movie_best.mp4", [make_frame((20, 30, 40), 12), make_frame((20, 30, 40), 62)])
+        other = make_feature("movie_other.mp4", [make_frame((30, 120, 60), 38), make_frame((30, 120, 60), 78)])
+
+        movie_features = [wrong, best, other]
+        localizer = alignment.shot_localizer
+        similarity = localizer.cosine_matrix([ref], movie_features)
+        matches = localizer.independent_localize(
+            [ref],
+            movie_features,
+            similarity,
+            neighbor_radius=0,
+            candidate_count=3,
+            top_k=3,
+        )
+
+        self.assertEqual(matches[0]["movie_name"], "movie_best.mp4")
+        self.assertGreater(matches[0]["score"], matches[0]["top_candidates"][1]["score"])
 
     def test_homography_score_handles_shifted_frame(self) -> None:
         img = np.zeros((180, 240, 3), dtype=np.uint8)
@@ -243,54 +222,122 @@ class VisualAlignmentV3Tests(unittest.TestCase):
         spatial = compare_homography_frames(img, shifted)["score"]
         self.assertGreaterEqual(spatial, temporal - 0.05)
 
-    def test_segmented_path_solver_preserves_high_confidence_jump_anchor(self) -> None:
-        ref_shots = [
-            {"start": 0.0, "end": 1.0},
-            {"start": 1.0, "end": 2.0},
-        ]
-        candidates = [
-            [
-                {
-                    "movie_index": 0,
-                    "movie_shot_id": "m001",
-                    "movie_start": 100.0,
-                    "movie_end": 101.0,
-                    "visual_score": 0.9,
-                    "refinement_score": 0.82,
-                },
-                {
-                    "movie_index": 1,
-                    "movie_shot_id": "m002",
-                    "movie_start": 200.0,
-                    "movie_end": 201.0,
-                    "visual_score": 0.7,
-                    "refinement_score": 0.7,
-                },
-            ],
-            [
-                {
-                    "movie_index": 2,
-                    "movie_shot_id": "m500",
-                    "movie_start": 500.0,
-                    "movie_end": 501.0,
-                    "visual_score": 0.91,
-                    "refinement_score": 0.83,
-                },
-                {
-                    "movie_index": 3,
-                    "movie_shot_id": "m102",
-                    "movie_start": 102.0,
-                    "movie_end": 103.0,
-                    "visual_score": 0.7,
-                    "refinement_score": 0.7,
-                },
-            ],
-        ]
+    def test_alignment_adapter_maps_localizer_index_to_pipeline_timeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ref_dir = root / "ref"
+            movie_dir = root / "movie"
+            ref_dir.mkdir()
+            movie_dir.mkdir()
+            (ref_dir / "ref_shot_001.mp4").touch()
+            (movie_dir / "movie_shot_000001.mp4").touch()
+            (movie_dir / "movie_shot_000002.mp4").touch()
 
-        chosen = path_solver.solve_segmented_global_path(ref_shots, candidates, min_visual_score=0.35)
-        self.assertEqual(chosen[0]["movie_shot_id"], "m001")
-        self.assertEqual(chosen[1]["movie_shot_id"], "m500")
-        self.assertTrue(chosen[1]["diagnostics"]["path"]["anchor"])
+            localizer = alignment.shot_localizer
+            original_extract = localizer.extract_all_features
+            original_localize = localizer.independent_localize
+
+            def fake_extract(paths, sample_count, size, workers, mask_text_bands):
+                features = []
+                for index, path in enumerate(paths):
+                    vector = np.zeros(4, dtype=np.float32)
+                    vector[index % 4] = 1.0
+                    features.append(
+                        localizer.ShotFeature(
+                            path=path,
+                            duration=1.0,
+                            frame_features=vector[None, :],
+                            clip_feature=vector,
+                            local_features=[],
+                        )
+                    )
+                return features
+
+            def fake_localize(ref_features, movie_features, similarity, neighbor_radius, candidate_count, top_k):
+                selected = {
+                    "movie_index": 1,
+                    "movie_name": movie_features[1].path.name,
+                    "score": 0.82,
+                    "geometry_score": 0.8,
+                    "geometry_inliers": 24,
+                    "good_matches": 30,
+                    "local_score": 0.7,
+                    "global_score": 0.75,
+                    "fine_score": 0.8,
+                    "sequence_support": 0.0,
+                    "movie_duration": 1.0,
+                }
+                return [{
+                    "ref_index": 0,
+                    "movie_index": 1,
+                    "score": 0.82,
+                    "geometry_inliers": 24,
+                    "good_matches": 30,
+                    "top_candidates": [selected],
+                }]
+
+            localizer.extract_all_features = fake_extract
+            localizer.independent_localize = fake_localize
+            try:
+                result = alignment.align_visual_timeline(
+                    {"ref_shots": [{"ref_shot_id": "ref_shot_001", "start": 1.0, "end": 2.5}]},
+                    {"movie_shots": [
+                        {"movie_shot_id": "movie_shot_000001", "start": 10.0, "end": 11.0},
+                        {"movie_shot_id": "movie_shot_000002", "start": 20.0, "end": 21.5},
+                    ]},
+                    ref_clip_dir=ref_dir,
+                    movie_clip_dir=movie_dir,
+                    export_pairs=False,
+                    min_geometry_inliers=20,
+                )
+            finally:
+                localizer.extract_all_features = original_extract
+                localizer.independent_localize = original_localize
+
+            row = result["ref_to_movie_timeline"][0]
+            self.assertEqual(row["ref_shot_id"], "ref_shot_001")
+            self.assertEqual(row["movie_shot_ids"], ["movie_shot_000002"])
+            self.assertEqual((row["movie_start"], row["movie_end"]), (20.0, 21.5))
+            self.assertEqual(row["status"], "matched")
+
+    def test_alignment_uses_keyframes_when_shot_clips_are_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ref_frame = root / "ref.jpg"
+            movie_frame = root / "movie.jpg"
+            image = np.zeros((96, 128, 3), dtype=np.uint8)
+            cv2.rectangle(image, (24, 20), (92, 72), (60, 180, 240), -1)
+            cv2.putText(image, "MATCH", (30, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.imwrite(str(ref_frame), image)
+            cv2.imwrite(str(movie_frame), image)
+
+            result = alignment.align_visual_timeline(
+                {"ref_shots": [{
+                    "ref_shot_id": "ref_shot_001",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "keyframes": [str(ref_frame)],
+                }]},
+                {"movie_shots": [{
+                    "movie_shot_id": "movie_shot_000001",
+                    "start": 10.0,
+                    "end": 11.0,
+                    "keyframes": [str(movie_frame)],
+                }]},
+                ref_clip_dir=root / "missing_ref_clips",
+                movie_clip_dir=root / "missing_movie_clips",
+                output_dir=root / "alignment",
+                diagnostics_dir=root / "diagnostics",
+                export_pairs=False,
+                candidate_count=1,
+                top_k=1,
+                min_geometry_inliers=1,
+            )
+
+            row = result["ref_to_movie_timeline"][0]
+            self.assertEqual(row["movie_shot_ids"], ["movie_shot_000001"])
+            self.assertEqual(result["metadata"]["reference_keyframe_fallback_count"], 1)
+            self.assertEqual(result["metadata"]["movie_keyframe_fallback_count"], 1)
 
 
 if __name__ == "__main__":

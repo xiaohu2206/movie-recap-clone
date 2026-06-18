@@ -78,6 +78,14 @@
         "to": "backend/5_script_visual_binder"
       },
       {
+        "from": "../5.1_movie_subtitle_filler",
+        "to": "backend/5.1_movie_subtitle_filler"
+      },
+      {
+        "from": "../5.2_audio_role_classifier",
+        "to": "backend/5.2_audio_role_classifier"
+      },
+      {
         "from": "../6_rewrite_engine",
         "to": "backend/6_rewrite_engine"
       },

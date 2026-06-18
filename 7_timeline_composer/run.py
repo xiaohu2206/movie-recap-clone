@@ -347,23 +347,17 @@ def compose_timeline(
     final_timeline = []
     cursor = 0.0
     used_visual_keys: set[str] = set()
-    last_movie_end: float | None = None
 
     def usable_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return _prepare_rows_for_timeline(
             rows,
             used_visual_keys=used_visual_keys,
-            min_movie_start=last_movie_end,
+            min_movie_start=None,
         )
 
     def remember_clips(clips: list[dict[str, Any]]) -> None:
-        nonlocal last_movie_end
         for clip in clips:
             used_visual_keys.update(_clip_visual_keys(clip))
-            last_movie_end = max(
-                last_movie_end if last_movie_end is not None else float(clip.get("movie_end") or 0.0),
-                float(clip.get("movie_end") or 0.0),
-            )
 
     def append_narration_item(base_item: dict[str, Any], idx: int, suffix: str, narration: str) -> None:
         nonlocal cursor
@@ -412,17 +406,6 @@ def compose_timeline(
         for group_index, group_rows in enumerate(groups, start=1):
             group_suffix = suffix if len(groups) == 1 else f"{suffix}_{group_index:02d}"
             duration = _group_span_duration(group_rows)
-            if duration < MIN_ORIGINAL_PLAY_DURATION:
-                narration = _original_group_narration(base_item, group_rows)
-                if narration:
-                    append_narration_item(
-                        _sub_item(base_item, group_rows),
-                        idx,
-                        f"{group_suffix}_narration",
-                        narration,
-                    )
-                continue
-
             clip = _clip(
                 1,
                 _row_start(group_rows[0]),
@@ -497,7 +480,7 @@ def compose_timeline(
             "movie_shot_extension": False,
             "min_original_play_duration": MIN_ORIGINAL_PLAY_DURATION,
             "dedupe_movie_shots": True,
-            "prevent_movie_rollback": True,
+            "prevent_movie_rollback": False,
         },
     }
 

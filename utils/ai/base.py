@@ -73,11 +73,23 @@ class AIProviderBase(ABC):
 
     def __init__(self, config: AIModelConfig):
         self.config = config
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(config.timeout or 180),
+        self._httpx_trust_env = trust_env_for_http_url(config.base_url)
+        self.client = self._build_client(trust_env=self._httpx_trust_env)
+
+    def _build_client(self, *, trust_env: bool) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(self.config.timeout or 180),
             headers=self._get_headers(),
-            trust_env=trust_env_for_http_url(config.base_url),
+            trust_env=trust_env,
         )
+
+    async def _reopen_client(self, *, trust_env: bool) -> None:
+        try:
+            await self.client.aclose()
+        except Exception:
+            pass
+        self._httpx_trust_env = trust_env
+        self.client = self._build_client(trust_env=trust_env)
     
     @abstractmethod
     def _get_headers(self) -> Dict[str, str]:

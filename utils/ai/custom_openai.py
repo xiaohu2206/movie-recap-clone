@@ -13,6 +13,8 @@ import logging
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 from .base import AIProviderBase, AIModelConfig, ChatMessage, ChatResponse
 
 logger = logging.getLogger(__name__)
@@ -108,7 +110,10 @@ class CustomOpenAIProvider(AIProviderBase):
                 except Exception:
                     pass
 
-            response_data = await self._make_stream_request(body, headers)
+            try:
+                response_data = await self._make_stream_request(body, headers)
+            except httpx.ConnectError as exc:
+                response_data = await self._retry_without_env_proxy_once(body, headers, exc)
 
             if isinstance(response_data, dict) and "error" in response_data:
                 error_info = response_data["error"]
@@ -138,6 +143,31 @@ class CustomOpenAIProvider(AIProviderBase):
         except Exception as e:
             logger.error(f"自定义 OpenAI 兼容 API 请求失败: {e}")
             raise
+
+    async def _retry_without_env_proxy_once(
+        self,
+        body: Dict[str, Any],
+        headers: Dict[str, str],
+        original_error: Exception,
+    ) -> Dict[str, Any]:
+        if not bool(getattr(self, "_httpx_trust_env", False)):
+            raise ConnectionError(
+                "AI 接口连接失败：无法连接到模型服务。请检查 CLONE_AI_BASE_URL、网络连接，"
+                "以及 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 代理设置。"
+            ) from original_error
+
+        logger.warning(
+            "AI 接口通过环境代理连接失败，改为直连重试一次: %s",
+            original_error,
+        )
+        await self._reopen_client(trust_env=False)
+        try:
+            return await self._make_stream_request(body, headers)
+        except httpx.ConnectError as direct_error:
+            raise ConnectionError(
+                "AI 接口连接失败：环境代理不可用，直连也失败。请检查 CLONE_AI_BASE_URL 是否正确，"
+                "或修复/关闭 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY。"
+            ) from direct_error
 
     async def _make_stream_request(self, body: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
         stream_body = dict(body)

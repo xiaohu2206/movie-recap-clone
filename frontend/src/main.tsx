@@ -183,7 +183,7 @@ const stages: Stage[] = [
 ];
 
 const defaultConfig: PipelineConfig = {
-  pipelineMode: "clone",
+  pipelineMode: "ref_audio_rebuild",
   refVideoPath: "",
   moviePath: "",
   subtitlePath: "",

@@ -119,6 +119,84 @@ class RefAudioRebuildTests(unittest.TestCase):
         self.assertIn("movie_clip_short", extended["duration_warnings"])
         self.assertEqual(result["quality_report"]["fallback_ref_shots"], 1)
 
+    def test_absorbs_ready_short_clip_into_previous_visual(self) -> None:
+        ref_analysis = {
+            "ref_video_id": "ref_demo",
+            "ref_shots": [
+                {"ref_shot_id": "ref_shot_001", "start": 0.0, "end": 2.5},
+                {"ref_shot_id": "ref_shot_002", "start": 2.5, "end": 2.9},
+                {"ref_shot_id": "ref_shot_003", "start": 2.9, "end": 5.0},
+            ],
+        }
+        timeline_data = {
+            "ref_to_movie_timeline": [
+                {
+                    "ref_shot_id": "ref_shot_001",
+                    "movie_start": 10.0,
+                    "movie_end": 12.5,
+                    "movie_shot_ids": ["movie_shot_010"],
+                    "status": "matched",
+                    "confidence": "medium",
+                    "match_score": 0.8,
+                },
+                {
+                    "ref_shot_id": "ref_shot_002",
+                    "movie_start": 100.0,
+                    "movie_end": 100.4,
+                    "movie_shot_ids": ["movie_shot_200"],
+                    "status": "matched",
+                    "confidence": "medium",
+                    "match_score": 0.7,
+                },
+                {
+                    "ref_shot_id": "ref_shot_003",
+                    "movie_start": 20.0,
+                    "movie_end": 21.6,
+                    "movie_shot_ids": ["movie_shot_020"],
+                    "status": "matched",
+                    "confidence": "medium",
+                    "match_score": 0.75,
+                },
+            ]
+        }
+
+        result = rebuild.compose_ref_audio_rebuild_timeline(
+            ref_analysis,
+            {"movie_shots": []},
+            timeline_data,
+            ref_video_path="data/ref.mp4",
+            movie_path="data/movie.mp4",
+        )
+
+        items = result["final_timeline"]
+        self.assertEqual(len(items), 2)
+
+        absorbed = items[0]
+        self.assertEqual(absorbed["source_ref_shot_ids"], ["ref_shot_001", "ref_shot_002"])
+        self.assertEqual(absorbed["external_audio"]["end"], 2.9)
+        self.assertEqual(len(absorbed["video_clips"]), 1)
+        self.assertEqual(absorbed["video_clips"][0]["movie_start"], 10.0)
+        self.assertEqual(absorbed["video_clips"][0]["movie_end"], 12.9)
+        self.assertEqual(absorbed["video_clips"][0]["fit_mode"], "extend_previous_for_short_ref")
+        self.assertIn("absorbed_short_ref_visual", absorbed["duration_warnings"])
+        self.assertEqual(result["quality_report"]["absorbed_short_ref_count"], 1)
+
+    def test_does_not_absorb_clip_at_short_duration_threshold(self) -> None:
+        previous = {
+            "status": "ready",
+            "external_audio": {"duration": 2.0},
+            "video_clips": [{"movie_start": 10.0, "movie_end": 12.0}],
+        }
+        at_threshold = {
+            "status": "ready",
+            "external_audio": {"duration": rebuild.MAX_SHORT_CLIP_DURATION},
+            "video_clips": [{"movie_start": 20.0, "movie_end": 20.5}],
+        }
+
+        items = rebuild.absorb_short_items([previous, at_threshold])
+
+        self.assertEqual(len(items), 2)
+
     def test_generate_video_cuts_reference_audio_without_tts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

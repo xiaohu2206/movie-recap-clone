@@ -518,6 +518,7 @@ class TransNetV2Torch:
     def __init__(self, model_dir: str, device: Optional[str] = None):
         self._device = self._resolve_device(device)
         self._device_fallback_reason: Optional[str] = None
+        self._last_timings: dict[str, float] = {}
         self._lock = threading.Lock()
         self._model = _TransNetV2Net()
 
@@ -563,10 +564,24 @@ class TransNetV2Torch:
         self._model.to(self._device)
 
     def get_backend_info(self) -> dict:
-        info = {"backend": "torch", "device": str(self._device)}
+        info = {
+            "backend": "torch",
+            "device": str(self._device),
+            "torch_version": str(torch.__version__),
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_version": str(torch.version.cuda or ""),
+        }
+        if self._device.type == "cuda":
+            try:
+                info["device_name"] = str(torch.cuda.get_device_name(self._device))
+            except Exception:
+                pass
         if self._device_fallback_reason:
             info["device_fallback"] = "cpu"
             info["device_fallback_reason"] = self._device_fallback_reason
+        last_timings = getattr(self, "_last_timings", None)
+        if last_timings:
+            info["timings"] = dict(last_timings)
         return info
 
     def predict_raw(self, frames: np.ndarray):
@@ -591,7 +606,7 @@ class TransNetV2Torch:
             x = x.contiguous()
         x = x.to(device=self._device, non_blocking=True)
         with self._lock:
-            with torch.no_grad():
+            with torch.inference_mode():
                 out = self._model(x)
 
         if isinstance(out, tuple):
@@ -627,7 +642,8 @@ class TransNetV2Torch:
             [start_frame] * no_padded_frames_start + [frames] + [end_frame] * no_padded_frames_end, 0
         )
 
-        batch = max(1, int(os.environ.get("TRANSNETV2_TORCH_BATCH") or 4))
+        default_batch = 8 if self._device.type == "cpu" else 4
+        batch = max(1, int(os.environ.get("TRANSNETV2_TORCH_BATCH") or default_batch))
         preds_single = []
         preds_all = []
         window = 0
@@ -674,6 +690,7 @@ class TransNetV2Torch:
             progress_callback(1.0)
 
         ffmpeg_bin = resolve_ffmpeg_bin()
+        decode_started = time.perf_counter()
 
         def _build_cmd(hwaccel_prefix: tuple[str, ...] = ()):
             cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin", *hwaccel_prefix]
@@ -760,13 +777,20 @@ class TransNetV2Torch:
                 raise RuntimeError(msg or "ffmpeg_extract_failed")
 
         video = np.frombuffer(out, np.uint8).reshape([-1, 27, 48, 3])
+        decode_seconds = time.perf_counter() - decode_started
 
         def wrapped_callback(pct: float):
             if progress_callback:
                 final_pct = 10.0 + (pct * 0.9)
                 progress_callback(final_pct)
 
-        return (video, *self.predict_frames(video, progress_callback=wrapped_callback))
+        inference_started = time.perf_counter()
+        predictions = self.predict_frames(video, progress_callback=wrapped_callback)
+        self._last_timings = {
+            "decode_seconds": round(decode_seconds, 3),
+            "inference_seconds": round(time.perf_counter() - inference_started, 3),
+        }
+        return (video, *predictions)
 
     @staticmethod
     def predictions_to_scenes(predictions: np.ndarray, threshold: float = 0.5):

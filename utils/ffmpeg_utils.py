@@ -171,6 +171,24 @@ def probe_duration(path: str | Path) -> float:
         return 0.0
 
 
+def probe_stream_duration(path: str | Path, codec_type: str) -> float:
+    """返回指定类型媒体流的最大 duration；无有效流时回退到 format.duration。"""
+    data = ffprobe_json(path)
+    best = 0.0
+    for stream in data.get("streams") or []:
+        if stream.get("codec_type") != codec_type:
+            continue
+        try:
+            duration = float(stream.get("duration") or 0.0)
+        except Exception:
+            duration = 0.0
+        if duration > 0:
+            best = max(best, duration)
+    if best > 0:
+        return best
+    return probe_duration(path)
+
+
 def probe_fps(path: str | Path) -> float:
     data = ffprobe_json(path)
     for stream in data.get("streams") or []:
