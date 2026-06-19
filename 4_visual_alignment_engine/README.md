@@ -24,6 +24,7 @@ outputs\3_movie_shot_parser\shot_clips
 --workers 4
 --neighbor-radius 2
 --candidate-count 30
+--geometry-candidate-count 24
 --top-k 3
 --min-score 0.35
 --min-geometry-inliers 20

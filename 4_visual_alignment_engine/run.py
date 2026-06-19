@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import shutil
 import sys
@@ -503,6 +504,7 @@ def align_visual_timeline(
     workers: int = 4,
     neighbor_radius: int = 2,
     candidate_count: int = 30,
+    geometry_candidate_count: int = 24,
     min_score: float = 0.35,
     low_score_threshold: float = 0.35,
     min_geometry_inliers: int = 20,
@@ -553,6 +555,12 @@ def align_visual_timeline(
     _progress(progress_callback, 68.0, "Building global shot similarity matrix")
     similarity = shot_localizer.cosine_matrix(ref_features, movie_features)
     _progress(progress_callback, 72.0, "Localizing shots with ORB retrieval and geometric verification")
+    localize_kwargs: dict[str, Any] = {}
+    localize_parameters = inspect.signature(shot_localizer.independent_localize).parameters
+    if "geometry_candidate_count" in localize_parameters:
+        localize_kwargs["geometry_candidate_count"] = geometry_candidate_count
+    if "workers" in localize_parameters:
+        localize_kwargs["workers"] = workers
     matches = shot_localizer.independent_localize(
         ref_features,
         movie_features,
@@ -560,6 +568,7 @@ def align_visual_timeline(
         neighbor_radius,
         candidate_count,
         top_k,
+        **localize_kwargs,
     )
     match_by_ref_index = {
         active_ref_clips[int(match["ref_index"])].index: match
@@ -641,6 +650,7 @@ def align_visual_timeline(
             "workers": int(workers),
             "neighbor_radius": int(neighbor_radius),
             "candidate_count": int(candidate_count),
+            "geometry_candidate_count": int(geometry_candidate_count),
             "top_k": int(top_k),
             "min_score": float(min_score),
             "low_score_threshold": float(low_score_threshold),
@@ -671,6 +681,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--neighbor-radius", "--neighbor-shot-window", dest="neighbor_radius", type=int, default=2)
     parser.add_argument("--candidate-count", "--recall-top-k", dest="candidate_count", type=int, default=30)
+    parser.add_argument("--geometry-candidate-count", type=int, default=24)
     parser.add_argument("--top-k", "--top-n", dest="top_k", type=int, default=3)
     parser.add_argument("--min-score", type=float, default=0.35)
     parser.add_argument("--low-score-threshold", type=float)
@@ -718,6 +729,7 @@ def main() -> None:
         workers=args.workers,
         neighbor_radius=args.neighbor_radius,
         candidate_count=args.candidate_count,
+        geometry_candidate_count=args.geometry_candidate_count,
         min_score=args.min_score,
         low_score_threshold=low_score_threshold,
         min_geometry_inliers=args.min_geometry_inliers,

@@ -57,7 +57,7 @@ class KeyframeSource:
 @dataclass
 class LocalHashIndex:
     movie_count: int
-    postings: dict[int, list[tuple[int, float]]]
+    postings: dict[int, tuple[np.ndarray, np.ndarray]]
 
 
 def list_video_files(root: Path) -> list[Path]:
@@ -298,6 +298,15 @@ def cosine_matrix(ref_features: list[ShotFeature], movie_features: list[ShotFeat
     return ref @ movie.T
 
 
+def top_indices(values: np.ndarray, count: int) -> np.ndarray:
+    count = max(1, min(int(count), len(values)))
+    all_indices = np.arange(len(values))
+    if count >= len(values):
+        return all_indices[np.lexsort((all_indices, values))[::-1]]
+    indices = np.argpartition(values, -count)[-count:]
+    return indices[np.lexsort((indices, values[indices]))[::-1]]
+
+
 def fine_score(ref_item: ShotFeature, movie_item: ShotFeature) -> float:
     sim = ref_item.frame_features @ movie_item.frame_features.T
     row_max = np.max(sim, axis=1).mean()
@@ -337,7 +346,7 @@ def build_local_hash_index(movie_features: list[ShotFeature]) -> tuple[LocalHash
         document_frequency[unique_hashes] += 1
 
     idf = np.log((len(movie_features) + 1.0) / (document_frequency + 1.0)) + 1.0
-    postings: dict[int, list[tuple[int, float]]] = {}
+    posting_lists: dict[int, list[tuple[int, float]]] = {}
     for movie_idx, hash_counts in enumerate(movie_hash_counts):
         if hash_counts is None:
             continue
@@ -347,7 +356,14 @@ def build_local_hash_index(movie_features: list[ShotFeature]) -> tuple[LocalHash
         if norm > 1e-6:
             weights /= norm
         for hash_value, weight in zip(unique_hashes, weights):
-            postings.setdefault(int(hash_value), []).append((movie_idx, float(weight)))
+            posting_lists.setdefault(int(hash_value), []).append((movie_idx, float(weight)))
+    postings = {
+        hash_value: (
+            np.fromiter((item[0] for item in rows), dtype=np.int32, count=len(rows)),
+            np.fromiter((item[1] for item in rows), dtype=np.float32, count=len(rows)),
+        )
+        for hash_value, rows in posting_lists.items()
+    }
     return LocalHashIndex(movie_count=len(movie_features), postings=postings), idf.astype(np.float32)
 
 
@@ -367,8 +383,11 @@ def local_hash_scores(
         query_weights /= norm
     scores = np.zeros(movie_index.movie_count, dtype=np.float32)
     for hash_value, query_weight in zip(unique_hashes, query_weights):
-        for movie_idx, movie_weight in movie_index.postings.get(int(hash_value), []):
-            scores[movie_idx] += float(query_weight) * movie_weight
+        posting = movie_index.postings.get(int(hash_value))
+        if posting is None:
+            continue
+        movie_indices, movie_weights = posting
+        scores[movie_indices] += float(query_weight) * movie_weights
     return scores
 
 
@@ -405,10 +424,10 @@ def ann_local_candidates(
     votes = np.zeros(movie_count, dtype=np.float32)
     for frame in ref_item.local_features:
         descriptors = frame.descriptors
-        if len(descriptors) > 600:
-            positions = np.linspace(0, len(descriptors) - 1, 600, dtype=np.int32)
+        if len(descriptors) > 320:
+            positions = np.linspace(0, len(descriptors) - 1, 320, dtype=np.int32)
             descriptors = descriptors[positions]
-        indices, distances = index.knnSearch(descriptors, 8, params={"checks": 64})
+        indices, distances = index.knnSearch(descriptors, 6, params={"checks": 32})
         for descriptor_idx in range(len(indices)):
             seen = set()
             for neighbor_idx, distance in zip(indices[descriptor_idx], distances[descriptor_idx]):
@@ -417,7 +436,17 @@ def ann_local_candidates(
                     continue
                 seen.add(owner)
                 votes[owner] += max(0.0, (68.0 - float(distance)) / 68.0)
-    return np.argsort(votes)[::-1][:candidate_count]
+    return top_indices(votes, candidate_count)
+
+
+def _limited_local_feature(feature: LocalFrameFeature, max_descriptors: int = 600) -> LocalFrameFeature:
+    if len(feature.descriptors) <= max_descriptors:
+        return feature
+    positions = np.linspace(0, len(feature.descriptors) - 1, max_descriptors, dtype=np.int32)
+    return LocalFrameFeature(
+        keypoints=feature.keypoints[positions],
+        descriptors=feature.descriptors[positions],
+    )
 
 
 def geometric_match_score(ref_item: ShotFeature, movie_item: ShotFeature) -> tuple[float, int, int]:
@@ -426,30 +455,39 @@ def geometric_match_score(ref_item: ShotFeature, movie_item: ShotFeature) -> tup
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
     best_inliers = 0
     best_good = 0
-    for ref_frame in ref_item.local_features:
-        for movie_frame in movie_item.local_features:
-            pairs = matcher.knnMatch(ref_frame.descriptors, movie_frame.descriptors, k=2)
-            good = [
-                pair[0]
-                for pair in pairs
-                if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance
-            ]
-            inliers = 0
-            if len(good) >= 4:
-                source = np.asarray(
-                    [ref_frame.keypoints[match.queryIdx] for match in good],
-                    dtype=np.float32,
-                ).reshape(-1, 1, 2)
-                target = np.asarray(
-                    [movie_frame.keypoints[match.trainIdx] for match in good],
-                    dtype=np.float32,
-                ).reshape(-1, 1, 2)
-                _, mask = cv2.findHomography(source, target, cv2.RANSAC, 5.0)
-                if mask is not None:
-                    inliers = int(mask.sum())
-            if (inliers, len(good)) > (best_inliers, best_good):
-                best_inliers = inliers
-                best_good = len(good)
+    ref_frames = [_limited_local_feature(frame) for frame in ref_item.local_features]
+    movie_frames = [_limited_local_feature(frame) for frame in movie_item.local_features]
+    frame_pairs = []
+    for ref_pos, ref_frame in enumerate(ref_frames):
+        for movie_pos, movie_frame in enumerate(movie_frames):
+            frame_pairs.append((abs(ref_pos - movie_pos), ref_pos, movie_pos, ref_frame, movie_frame))
+    frame_pairs.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    for _, _, _, ref_frame, movie_frame in frame_pairs:
+        pairs = matcher.knnMatch(ref_frame.descriptors, movie_frame.descriptors, k=2)
+        good = [
+            pair[0]
+            for pair in pairs
+            if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance
+        ]
+        inliers = 0
+        if len(good) >= 4 and len(good) >= best_inliers:
+            source = np.asarray(
+                [ref_frame.keypoints[match.queryIdx] for match in good],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            target = np.asarray(
+                [movie_frame.keypoints[match.trainIdx] for match in good],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            _, mask = cv2.findHomography(source, target, cv2.RANSAC, 5.0)
+            if mask is not None:
+                inliers = int(mask.sum())
+        if (inliers, len(good)) > (best_inliers, best_good):
+            best_inliers = inliers
+            best_good = len(good)
+            if best_inliers >= 35 and best_good >= 50:
+                break
 
     score = 0.75 * min(best_inliers / 35.0, 1.0) + 0.25 * min(best_good / 50.0, 1.0)
     return float(score), best_inliers, best_good
@@ -462,6 +500,8 @@ def independent_localize(
     neighbor_radius: int,
     candidate_count: int,
     top_k: int,
+    geometry_candidate_count: int | None = None,
+    workers: int = 1,
 ) -> list[dict]:
     if not ref_features:
         return []
@@ -469,6 +509,9 @@ def independent_localize(
         raise RuntimeError("No movie shot features are available for localization")
     candidate_count = max(1, min(int(candidate_count), len(movie_features)))
     top_k = max(1, int(top_k))
+    geometry_limit = len(movie_features) if geometry_candidate_count is None else int(geometry_candidate_count)
+    geometry_limit = max(top_k, min(max(1, geometry_limit), len(movie_features)))
+    workers = max(1, int(workers))
     print("[match] building local feature index", flush=True)
     movie_index, idf = build_local_hash_index(movie_features)
     local_scores = []
@@ -476,8 +519,14 @@ def independent_localize(
     for idx, ref_item in enumerate(ref_features):
         scores = local_hash_scores(ref_item, movie_index, idf)
         local_scores.append(scores)
-        local_orders.append(np.argsort(scores)[::-1][:candidate_count])
+        local_orders.append(top_indices(scores, candidate_count))
         print(f"[retrieve] {idx + 1}/{len(ref_features)} {ref_item.path.name}", flush=True)
+
+    global_order_count = max(15, min(len(movie_features), geometry_limit))
+    global_orders = [
+        top_indices(global_similarity[ref_idx], global_order_count)
+        for ref_idx in range(len(ref_features))
+    ]
 
     candidate_sets = []
     for ref_idx, ref_item in enumerate(ref_features):
@@ -487,27 +536,95 @@ def independent_localize(
             min(len(ref_features), ref_idx + neighbor_radius + 1),
         ):
             candidate_indices.update(int(item) for item in local_orders[neighbor_idx][:5])
-            neighbor_global = np.argsort(global_similarity[neighbor_idx])[::-1][:5]
-            candidate_indices.update(int(item) for item in neighbor_global)
-        global_order = np.argsort(global_similarity[ref_idx])[::-1][:15]
-        candidate_indices.update(int(item) for item in global_order)
+            candidate_indices.update(int(item) for item in global_orders[neighbor_idx][:5])
+        candidate_indices.update(int(item) for item in global_orders[ref_idx][:15])
         candidate_sets.append(candidate_indices)
 
     geometry_cache: dict[tuple[int, int], tuple[float, int, int]] = {}
+    fine_cache: dict[tuple[int, int], float] = {}
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+
+    def get_fine(ref_idx: int, movie_idx: int) -> float:
+        cache_key = (ref_idx, movie_idx)
+        if cache_key not in fine_cache:
+            fine_cache[cache_key] = float(np.clip(fine_score(ref_features[ref_idx], movie_features[movie_idx]), 0.0, 1.0))
+        return fine_cache[cache_key]
+
+    def cheap_candidate_score(ref_idx: int, movie_idx: int, sequence_support: dict[int, float]) -> float:
+        ref_item = ref_features[ref_idx]
+        movie_item = movie_features[movie_idx]
+        max_local = max(float(local_scores[ref_idx].max()), 1e-6)
+        local_score = float(local_scores[ref_idx][movie_idx] / max_local)
+        global_score = float(np.clip(global_similarity[ref_idx, movie_idx], 0.0, 1.0))
+        fine = get_fine(ref_idx, movie_idx)
+        duration_ratio = min(ref_item.duration, movie_item.duration) / max(ref_item.duration, movie_item.duration)
+        support = min(sequence_support.get(movie_idx, 0.0), 0.30)
+        return 0.35 * local_score + 0.25 * fine + 0.25 * global_score + 0.10 * duration_ratio + support
+
+    def geometry_indices(ref_idx: int, sequence_support: dict[int, float]) -> list[int]:
+        candidates = candidate_sets[ref_idx]
+        if len(candidates) <= geometry_limit:
+            return list(candidates)
+
+        forced = set(int(item) for item in local_orders[ref_idx][:min(10, geometry_limit)])
+        forced.update(int(item) for item in global_orders[ref_idx][:min(8, geometry_limit)])
+        forced.update(int(item) for item in sequence_support)
+
+        ranked = sorted(
+            candidates,
+            key=lambda movie_idx: cheap_candidate_score(ref_idx, int(movie_idx), sequence_support),
+            reverse=True,
+        )
+        selected: list[int] = []
+        seen: set[int] = set()
+        for movie_idx in [*forced, *ranked]:
+            movie_idx = int(movie_idx)
+            if movie_idx in seen or movie_idx not in candidates:
+                continue
+            seen.add(movie_idx)
+            selected.append(movie_idx)
+            if len(selected) >= max(geometry_limit, len(forced)):
+                break
+        return selected
+
+    def ensure_geometry(ref_idx: int, movie_indices: list[int]) -> None:
+        missing = [
+            (ref_idx, movie_idx)
+            for movie_idx in movie_indices
+            if (ref_idx, movie_idx) not in geometry_cache
+        ]
+        if not missing:
+            return
+        if executor is None:
+            for ref_item_idx, movie_idx in missing:
+                geometry_cache[(ref_item_idx, movie_idx)] = geometric_match_score(
+                    ref_features[ref_item_idx],
+                    movie_features[movie_idx],
+                )
+            return
+        futures = {
+            executor.submit(geometric_match_score, ref_features[ref_item_idx], movie_features[movie_idx]): (
+                ref_item_idx,
+                movie_idx,
+            )
+            for ref_item_idx, movie_idx in missing
+        }
+        for future in as_completed(futures):
+            geometry_cache[futures[future]] = future.result()
 
     def rank_candidates(ref_idx: int, sequence_support: dict[int, float]) -> list[dict]:
         ref_item = ref_features[ref_idx]
         max_local = max(float(local_scores[ref_idx].max()), 1e-6)
+        selected_indices = geometry_indices(ref_idx, sequence_support)
+        ensure_geometry(ref_idx, selected_indices)
         ranked = []
-        for movie_idx in candidate_sets[ref_idx]:
+        for movie_idx in selected_indices:
             movie_item = movie_features[movie_idx]
             cache_key = (ref_idx, movie_idx)
-            if cache_key not in geometry_cache:
-                geometry_cache[cache_key] = geometric_match_score(ref_item, movie_item)
             geometry, inliers, good_matches = geometry_cache[cache_key]
             local_score = float(local_scores[ref_idx][movie_idx] / max_local)
             global_score = float(np.clip(global_similarity[ref_idx, movie_idx], 0.0, 1.0))
-            fine = float(np.clip(fine_score(ref_item, movie_item), 0.0, 1.0))
+            fine = get_fine(ref_idx, movie_idx)
             duration_ratio = min(ref_item.duration, movie_item.duration) / max(ref_item.duration, movie_item.duration)
             support = min(sequence_support.get(movie_idx, 0.0), 0.30)
             if inliers >= 8:
@@ -534,77 +651,82 @@ def independent_localize(
         ranked.sort(key=lambda item: item["score"], reverse=True)
         return ranked
 
-    preliminary = [rank_candidates(ref_idx, {})[0] for ref_idx in range(len(ref_features))]
-    weak_indices = [
-        ref_idx
-        for ref_idx, best in enumerate(preliminary)
-        if best["geometry_inliers"] < 8
-    ]
-    if weak_indices:
-        print(f"[match] ANN fallback for {len(weak_indices)} weak reference clips", flush=True)
-        ann_data = build_local_ann(movie_features)
-        if ann_data is not None:
-            ann_index, descriptor_owners = ann_data
-            for position, ref_idx in enumerate(weak_indices, 1):
-                if not ref_features[ref_idx].local_features:
-                    continue
-                candidates = ann_local_candidates(
-                    ref_features[ref_idx],
-                    ann_index,
-                    descriptor_owners,
-                    len(movie_features),
-                    max(candidate_count, 24),
-                )
-                candidate_sets[ref_idx].update(int(item) for item in candidates)
-                print(
-                    f"[ann] {position}/{len(weak_indices)} {ref_features[ref_idx].path.name}",
-                    flush=True,
-                )
-            preliminary = [rank_candidates(ref_idx, {})[0] for ref_idx in range(len(ref_features))]
+    try:
+        preliminary = [rank_candidates(ref_idx, {})[0] for ref_idx in range(len(ref_features))]
+        weak_indices = [
+            ref_idx
+            for ref_idx, best in enumerate(preliminary)
+            if best["geometry_inliers"] < 8
+        ]
+        if weak_indices:
+            print(f"[match] ANN fallback for {len(weak_indices)} weak reference clips", flush=True)
+            ann_data = build_local_ann(movie_features)
+            if ann_data is not None:
+                ann_index, descriptor_owners = ann_data
+                for position, ref_idx in enumerate(weak_indices, 1):
+                    if not ref_features[ref_idx].local_features:
+                        continue
+                    candidates = ann_local_candidates(
+                        ref_features[ref_idx],
+                        ann_index,
+                        descriptor_owners,
+                        len(movie_features),
+                        max(candidate_count, 24),
+                    )
+                    candidate_sets[ref_idx].update(int(item) for item in candidates)
+                    print(
+                        f"[ann] {position}/{len(weak_indices)} {ref_features[ref_idx].path.name}",
+                        flush=True,
+                    )
+                for ref_idx in weak_indices:
+                    preliminary[ref_idx] = rank_candidates(ref_idx, {})[0]
 
-    sequence_supports: list[dict[int, float]] = [dict() for _ in ref_features]
-    for ref_idx in range(len(ref_features)):
-        for neighbor_idx in range(
-            max(0, ref_idx - neighbor_radius),
-            min(len(ref_features), ref_idx + neighbor_radius + 1),
-        ):
-            if neighbor_idx == ref_idx or preliminary[neighbor_idx]["geometry_inliers"] < 10:
-                continue
-            ref_distance = abs(neighbor_idx - ref_idx)
-            center = preliminary[neighbor_idx]["movie_index"]
-            for movie_offset in range(-2, 3):
-                movie_idx = center + movie_offset
-                if not 0 <= movie_idx < len(movie_features):
+        sequence_supports: list[dict[int, float]] = [dict() for _ in ref_features]
+        for ref_idx in range(len(ref_features)):
+            for neighbor_idx in range(
+                max(0, ref_idx - neighbor_radius),
+                min(len(ref_features), ref_idx + neighbor_radius + 1),
+            ):
+                if neighbor_idx == ref_idx or preliminary[neighbor_idx]["geometry_inliers"] < 10:
                     continue
-                candidate_sets[ref_idx].add(movie_idx)
-                bonus = (0.18 / ref_distance) * (1.0 - 0.2 * abs(movie_offset))
-                sequence_supports[ref_idx][movie_idx] = sequence_supports[ref_idx].get(movie_idx, 0.0) + bonus
+                ref_distance = abs(neighbor_idx - ref_idx)
+                center = preliminary[neighbor_idx]["movie_index"]
+                for movie_offset in range(-2, 3):
+                    movie_idx = center + movie_offset
+                    if not 0 <= movie_idx < len(movie_features):
+                        continue
+                    candidate_sets[ref_idx].add(movie_idx)
+                    bonus = (0.18 / ref_distance) * (1.0 - 0.2 * abs(movie_offset))
+                    sequence_supports[ref_idx][movie_idx] = sequence_supports[ref_idx].get(movie_idx, 0.0) + bonus
 
-    results = []
-    for ref_idx, ref_item in enumerate(ref_features):
-        ranked = rank_candidates(ref_idx, sequence_supports[ref_idx])
-        best = ranked[0]
-        results.append(
-            {
-                "ref_index": ref_idx,
-                "ref_name": ref_item.path.name,
-                "movie_index": best["movie_index"],
-                "movie_name": best["movie_name"],
-                "score": best["score"],
-                "ref_duration": float(ref_item.duration),
-                "movie_duration": best["movie_duration"],
-                "status": "localized",
-                "geometry_inliers": best["geometry_inliers"],
-                "good_matches": best["good_matches"],
-                "top_candidates": ranked[:top_k],
-            }
-        )
-        print(
-            f"[verify] {ref_idx + 1}/{len(ref_features)} {ref_item.path.name} -> "
-            f"{best['movie_name']} score={best['score']:.4f} inliers={best['geometry_inliers']}",
-            flush=True,
-        )
-    return results
+        results = []
+        for ref_idx, ref_item in enumerate(ref_features):
+            ranked = rank_candidates(ref_idx, sequence_supports[ref_idx])
+            best = ranked[0]
+            results.append(
+                {
+                    "ref_index": ref_idx,
+                    "ref_name": ref_item.path.name,
+                    "movie_index": best["movie_index"],
+                    "movie_name": best["movie_name"],
+                    "score": best["score"],
+                    "ref_duration": float(ref_item.duration),
+                    "movie_duration": best["movie_duration"],
+                    "status": "localized",
+                    "geometry_inliers": best["geometry_inliers"],
+                    "good_matches": best["good_matches"],
+                    "top_candidates": ranked[:top_k],
+                }
+            )
+            print(
+                f"[verify] {ref_idx + 1}/{len(ref_features)} {ref_item.path.name} -> "
+                f"{best['movie_name']} score={best['score']:.4f} inliers={best['geometry_inliers']}",
+                flush=True,
+            )
+        return results
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
 
 def clear_directory_children(path: Path) -> None:
@@ -738,11 +860,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample-count", type=int, default=6, help="Frames sampled from each shot clip.")
     parser.add_argument("--frame-size", type=int, default=384, help="Square frame size used for descriptors.")
-    parser.add_argument("--workers", type=int, default=4, help="Parallel workers for feature extraction.")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel workers for feature extraction and geometric verification.")
     parser.add_argument("--low-score-threshold", type=float, default=0.35, help="Localized results below this score are copied into low_confidence_pairs.")
     parser.add_argument("--min-geometry-inliers", type=int, default=20, help="Results below this geometric inlier count are copied into low_confidence_pairs.")
     parser.add_argument("--top-k", type=int, default=3, help="Number of candidate movie shots to export per localized reference shot.")
-    parser.add_argument("--candidate-count", type=int, default=30, help="Local-feature candidates retained for geometric verification.")
+    parser.add_argument("--candidate-count", type=int, default=30, help="Local-feature candidates retained for recall.")
+    parser.add_argument(
+        "--geometry-candidate-count",
+        type=int,
+        default=24,
+        help="Recalled candidates per reference shot that receive ORB geometric verification.",
+    )
     parser.add_argument("--neighbor-radius", type=int, default=2, help="Adjacent reference shots used to supplement weak candidate recall.")
     parser.add_argument("--reference-limit", type=int, default=0, help="Limit reference clips for diagnostics; 0 processes all clips.")
     return parser.parse_args()
@@ -787,6 +915,8 @@ def main() -> None:
         args.neighbor_radius,
         args.candidate_count,
         args.top_k,
+        geometry_candidate_count=args.geometry_candidate_count,
+        workers=args.workers,
     )
 
     print(f"[export] writing results to {args.output_dir}", flush=True)
